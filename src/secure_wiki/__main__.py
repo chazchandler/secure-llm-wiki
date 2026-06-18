@@ -299,7 +299,16 @@ def _run_pipeline(
         content_hash=SourceRef.compute_hash(source_text),
     )
 
-    # 4. Extract claims
+    # 4. Save source document (sanitized text; idempotent on re-ingest)
+    store.save_source(
+        source_id=source_ref.id,
+        uri=uri,
+        content_hash=source_ref.content_hash,
+        trust_level=trust.value,
+        text=source_text,
+    )
+
+    # 5. Extract claims
     with _spinner("[extract]  calling extraction model…"):
         claims, extract_usage, parse_error = extract_claims(source_text, source_ref, trust)
     if not claims:
@@ -311,7 +320,7 @@ def _run_pipeline(
     print(f"[extract]  {len(claims)} claim(s) extracted")
     print()
 
-    # 5. Embeddings — computed in parallel
+    # 6. Embeddings — computed in parallel
     new_embeddings: dict[str, list[float]] = {}
     try:
         embed_client = get_embed_client()
@@ -328,7 +337,7 @@ def _run_pipeline(
     except Exception as exc:
         print(f"[embed]    unavailable ({exc}), Gate 5 falls back to section heuristic")
 
-    # 6. Batch adversarial review — one call for all claims from this source
+    # 7. Batch adversarial review — one call for all claims from this source
     existing_trusted = [
         c for c in existing
         if c.trust_level.value == "trusted" and c.status.value == "active"
@@ -343,7 +352,7 @@ def _run_pipeline(
     print(f"[review]   {status}  {'; '.join(batch_review.reasons) if batch_review.reasons else 'no issues'}")
     print()
 
-    # 7. Gate + store (review result pre-supplied — no extra LLM call per claim)
+    # 8. Gate + store (review result pre-supplied — no extra LLM call per claim)
     committed = quarantined = escalated = 0
     width = len(f"[gate {len(claims)}/{len(claims)}]") + 2
 

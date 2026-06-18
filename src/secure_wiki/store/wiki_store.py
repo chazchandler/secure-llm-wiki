@@ -95,6 +95,7 @@ class WikiStore:
         self.root = root or Path(os.environ.get("WIKI_DATA_PATH", "wiki_data"))
         self.pages = self.root / "pages"
         self.quarantine = self.root / "quarantine"
+        self.sources = self.root / "sources"
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -104,6 +105,7 @@ class WikiStore:
         """Create the wiki repo from scratch if it doesn't exist."""
         self.pages.mkdir(parents=True, exist_ok=True)
         self.quarantine.mkdir(parents=True, exist_ok=True)
+        self.sources.mkdir(parents=True, exist_ok=True)
 
         if (self.root / ".git").exists():
             return
@@ -141,6 +143,45 @@ class WikiStore:
         reason = gate_detail[:72] if gate_detail else "gate failed"
         msg = f"quarantine {claim.claim_id[:8]} from {claim.source.uri}: {reason}"
         self._commit(path, msg)
+        return path
+
+    def save_source(
+        self,
+        source_id: str,
+        uri: str,
+        content_hash: str,
+        trust_level: str,
+        text: str,
+    ) -> Path:
+        """Write sanitized source text to sources/ and commit.
+
+        Skips the commit if the same content_hash is already stored (idempotent
+        re-ingestion of an unchanged source produces no extra git commit).
+        """
+        from datetime import datetime, timezone
+
+        self._ensure_init()
+        self.sources.mkdir(parents=True, exist_ok=True)
+        path = self.sources / f"{source_id}.md"
+
+        # Skip if already stored with the same hash
+        if path.exists() and f"content_hash: {content_hash}" in path.read_text(encoding="utf-8"):
+            return path
+
+        frontmatter = yaml.dump(
+            {
+                "content_hash": content_hash,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "source_id": source_id,
+                "trust_level": trust_level,
+                "uri": uri,
+            },
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=True,
+        )
+        path.write_text(f"---\n{frontmatter}---\n\n{text}\n", encoding="utf-8")
+        self._commit(path, f"add source {source_id} [{trust_level}] from {uri}")
         return path
 
     # ------------------------------------------------------------------

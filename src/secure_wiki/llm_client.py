@@ -1,10 +1,13 @@
-"""LLM client abstraction supporting Ollama and Anthropic (Spec 7).
+"""LLM client abstraction supporting Ollama, Anthropic, and OpenAI (Spec 7).
 
 Provider and model selection via environment variables:
   LLM_PROVIDER      = "ollama" | "anthropic"     (default: "ollama")
+  EMBED_PROVIDER    = "ollama" | "openai"         (default: LLM_PROVIDER; use "openai" when LLM_PROVIDER=anthropic)
   EXTRACTION_MODEL  = model for claim extraction  (default: llama3.2 / claude-haiku-4-5)
   REVIEW_MODEL      = model for adversarial review (default: mistral / claude-haiku-4-5)
+  EMBED_MODEL       = model for embeddings        (default: nomic-embed-text / text-embedding-3-small)
   OLLAMA_HOST       = Ollama server URL           (default: http://localhost:11434)
+  OPENAI_API_KEY    = required when EMBED_PROVIDER=openai
 
 REVIEW_MODEL should differ from EXTRACTION_MODEL to preserve 4-eyes independence:
 a jailbreak that compromises the extractor must not simultaneously compromise the reviewer.
@@ -49,10 +52,10 @@ def strip_fences(text: str) -> str:
 
 def extract_json_object(text: str) -> str:
     """Extract the first complete JSON object from text that may have trailing prose."""
+    import json
     text = strip_fences(text)
     # Fast path: entire text is already valid JSON
     try:
-        import json
         json.loads(text)
         return text
     except (json.JSONDecodeError, ValueError):
@@ -98,13 +101,13 @@ class OllamaClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            options={"temperature": 0},
+            options={"temperature": 0, "num_predict": 4096},
         )
         usage = UsageInfo(
             input_tokens=getattr(response, "prompt_eval_count", 0) or 0,
             output_tokens=getattr(response, "eval_count", 0) or 0,
         )
-        return CompletionResult(text=response.message.content, usage=usage)
+        return CompletionResult(text=response.message.content or "", usage=usage)
 
     def stream(self, system: str, user: str) -> Iterator[str | UsageInfo]:
         """Yield text chunks as they arrive, then a final UsageInfo sentinel."""
@@ -115,7 +118,7 @@ class OllamaClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            options={"temperature": 0},
+            options={"temperature": 0, "num_predict": 4096},
             stream=True,
         ):
             if chunk.message.content:
@@ -127,7 +130,7 @@ class OllamaClient:
 
     def embed(self, text: str) -> list[float]:
         response = self._client.embed(model=self._model, input=text)
-        return response.embeddings[0]
+        return list(response.embeddings[0])
 
 
 class AnthropicClient:
@@ -137,9 +140,10 @@ class AnthropicClient:
         self._model = model
 
     def complete(self, system: str, user: str) -> CompletionResult:
+        from anthropic.types import TextBlock
         msg = self._client.messages.create(
             model=self._model,
-            max_tokens=2048,
+            max_tokens=8192,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
@@ -147,13 +151,14 @@ class AnthropicClient:
             input_tokens=msg.usage.input_tokens,
             output_tokens=msg.usage.output_tokens,
         )
-        return CompletionResult(text=msg.content[0].text, usage=usage)
+        text = next((b.text for b in msg.content if isinstance(b, TextBlock)), "")
+        return CompletionResult(text=text, usage=usage)
 
     def stream(self, system: str, user: str) -> Iterator[str | UsageInfo]:
         """Yield text chunks as they arrive, then a final UsageInfo sentinel."""
         with self._client.messages.stream(
             model=self._model,
-            max_tokens=2048,
+            max_tokens=8192,
             system=system,
             messages=[{"role": "user", "content": user}],
         ) as s:
@@ -164,8 +169,19 @@ class AnthropicClient:
                 output_tokens=final.usage.output_tokens,
             )
 
+    def embed(self, _: str) -> list[float]:
+        raise NotImplementedError("Anthropic provider does not support embeddings; set EMBED_PROVIDER=openai for Gate 5 similarity checks")
+
+
+class OpenAIEmbedClient:
+    def __init__(self, model: str) -> None:
+        import openai
+        self._client = openai.OpenAI()
+        self._model = model
+
     def embed(self, text: str) -> list[float]:
-        raise NotImplementedError("Anthropic provider does not support embeddings; set LLM_PROVIDER=ollama for Gate 5 similarity checks")
+        response = self._client.embeddings.create(model=self._model, input=text)
+        return response.data[0].embedding
 
 
 _EXTRACTION_DEFAULTS: dict[str, str] = {
@@ -178,7 +194,7 @@ _REVIEW_DEFAULTS: dict[str, str] = {
 }
 _EMBED_DEFAULTS: dict[str, str] = {
     "ollama": "nomic-embed-text",
-    "anthropic": "",
+    "openai": "text-embedding-3-small",
 }
 
 
@@ -205,5 +221,18 @@ def get_review_client() -> OllamaClient | AnthropicClient:
     return _build_client("review")
 
 
-def get_embed_client() -> OllamaClient | AnthropicClient:
-    return _build_client("embed")
+def get_embed_client() -> OllamaClient | OpenAIEmbedClient:
+    llm_provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    embed_provider = os.environ.get("EMBED_PROVIDER", llm_provider).lower()
+    if embed_provider == "openai":
+        model = os.environ.get("EMBED_MODEL", _EMBED_DEFAULTS["openai"])
+        return OpenAIEmbedClient(model)
+    if embed_provider == "anthropic":
+        raise NotImplementedError(
+            "Anthropic provider does not support embeddings; "
+            "set EMBED_PROVIDER=openai and provide OPENAI_API_KEY"
+        )
+    # ollama
+    model = os.environ.get("EMBED_MODEL", _EMBED_DEFAULTS.get("ollama", "nomic-embed-text"))
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    return OllamaClient(model, host=host)
