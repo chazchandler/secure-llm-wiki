@@ -23,7 +23,7 @@ from pathlib import Path
 
 import yaml
 
-from ..models import Claim, ClaimStatus
+from ..models import Claim, ClaimStatus, WikiPage
 
 _TRUST_RULES_TEMPLATE = """\
 # Trust rules for this wiki instance.
@@ -96,6 +96,7 @@ class WikiStore:
         self.pages = self.root / "pages"
         self.quarantine = self.root / "quarantine"
         self.sources = self.root / "sources"
+        self.wiki = self.root / "wiki"
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -106,6 +107,9 @@ class WikiStore:
         self.pages.mkdir(parents=True, exist_ok=True)
         self.quarantine.mkdir(parents=True, exist_ok=True)
         self.sources.mkdir(parents=True, exist_ok=True)
+        (self.wiki / "summaries").mkdir(parents=True, exist_ok=True)
+        (self.wiki / "concepts").mkdir(parents=True, exist_ok=True)
+        (self.wiki / "entities").mkdir(parents=True, exist_ok=True)
 
         if (self.root / ".git").exists():
             return
@@ -117,6 +121,14 @@ class WikiStore:
         rules_file = self.root / "trust_rules.yaml"
         if not rules_file.exists():
             rules_file.write_text(_TRUST_RULES_TEMPLATE, encoding="utf-8")
+
+        index = self.wiki / "index.md"
+        if not index.exists():
+            index.write_text("# Wiki Index\n\n(no pages yet)\n", encoding="utf-8")
+
+        log = self.wiki / "log.md"
+        if not log.exists():
+            log.write_text("# Ingest Log\n\n", encoding="utf-8")
 
         _git(["add", "."], self.root)
         _git(["commit", "-m", "Initialize wiki store"], self.root)
@@ -183,6 +195,60 @@ class WikiStore:
         path.write_text(f"---\n{frontmatter}---\n\n{text}\n", encoding="utf-8")
         self._commit(path, f"add source {source_id} [{trust_level}] from {uri}")
         return path
+
+    _PAGE_SUBDIR = {"summary": "summaries", "concept": "concepts", "entity": "entities"}
+
+    def save_wiki_page(self, page: WikiPage) -> Path:
+        """Write a wiki page to wiki/<type>s/<slug>.md (no commit)."""
+        self._ensure_init()
+        subdir_name = self._PAGE_SUBDIR.get(page.page_type, f"{page.page_type}s")
+        subdir = self.wiki / subdir_name
+        subdir.mkdir(parents=True, exist_ok=True)
+        path = subdir / f"{page.slug}.md"
+        path.write_text(page.to_markdown(), encoding="utf-8")
+        return path
+
+    def _commit_many(self, paths: list[Path], message: str) -> None:
+        """Stage the given paths and make a single commit. Skips if nothing staged."""
+        for path in paths:
+            rel = str(path.relative_to(self.root))
+            _git(["add", rel], self.root)
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=self.root,
+            env=_GIT_ENV,
+        )
+        if result.returncode == 0:
+            return  # nothing staged
+        _git(["commit", "-m", message], self.root)
+
+    def update_index(self) -> Path:
+        """Regenerate wiki/index.md from all concept/entity/summary pages."""
+        self._ensure_init()
+        lines = ["# Wiki Index\n"]
+        for subdir_name in ("summaries", "concepts", "entities"):
+            subdir = self.wiki / subdir_name
+            pages = sorted(subdir.glob("*.md")) if subdir.exists() else []
+            if pages:
+                lines.append(f"\n## {subdir_name.capitalize()}\n")
+                for p in pages:
+                    slug = p.stem
+                    lines.append(f"- [[{subdir_name}/{slug}]]")
+        index = self.wiki / "index.md"
+        index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return index
+
+    def append_log(self, entry: str) -> Path:
+        """Append a timestamped entry to wiki/log.md."""
+        from datetime import datetime, timezone
+        self._ensure_init()
+        log = self.wiki / "log.md"
+        if not log.exists():
+            log.write_text("# Ingest Log\n\n", encoding="utf-8")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"{ts}  {entry}\n")
+        return log
 
     # ------------------------------------------------------------------
     # Reads

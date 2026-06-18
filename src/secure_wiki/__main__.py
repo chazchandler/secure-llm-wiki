@@ -37,7 +37,16 @@ except ImportError:
     pass
 
 from .extraction.extractor import extract_claims
+from .graph.enricher import enrich_wiki
+from .lint.checker import (
+    check_incomplete_pages,
+    check_low_confidence_claims,
+    check_missing_links,
+    check_orphans,
+)
+from .lint.fixer import apply_fixes
 from .llm_client import UsageInfo
+from .models import LintReport
 from .review.adversarial import review_write
 from .gate.write_gate import GateDecision, run_write_gate
 from .ingestion.sanitizer import sanitize
@@ -354,6 +363,7 @@ def _run_pipeline(
 
     # 8. Gate + store (review result pre-supplied — no extra LLM call per claim)
     committed = quarantined = escalated = 0
+    committed_ids: set[str] = set()
     width = len(f"[gate {len(claims)}/{len(claims)}]") + 2
 
     for i, claim in enumerate(claims, 1):
@@ -375,6 +385,7 @@ def _run_pipeline(
             if claim.claim_id in new_embeddings:
                 emb_store.save(claim.claim_id, new_embeddings[claim.claim_id])
                 existing_embeddings[claim.claim_id] = new_embeddings[claim.claim_id]
+            committed_ids.add(claim.claim_id)
             committed += 1
             print(f"{label} COMMIT      {_preview(claim.text)}")
         elif outcome.decision == GateDecision.QUARANTINE:
@@ -385,6 +396,13 @@ def _run_pipeline(
             store.save_quarantined(claim, outcome.detail)
             escalated += 1
             print(f"{label} ESCALATE    {outcome.detail}")
+
+    # 9. Graph enrichment — runs after all claims are committed
+    committed_claims = [c for c in claims if c.claim_id in committed_ids]
+    if committed_claims:
+        with _spinner("[enrich]   generating wiki pages…"):
+            n_concepts, n_entities = enrich_wiki(committed_claims, source_ref, store)
+        print(f"[enrich]   {n_concepts} concept(s), {n_entities} entity(ies) written")
 
     return committed, quarantined, escalated, extract_usage
 
@@ -596,6 +614,61 @@ def cmd_clear(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_lint(args: argparse.Namespace) -> None:
+    store = WikiStore()
+    report_only = getattr(args, "report_only", False)
+
+    orphans = check_orphans(store)
+    missing = check_missing_links(store)
+    incomplete = check_incomplete_pages(store)
+    low_conf = check_low_confidence_claims(store)
+
+    report = LintReport(
+        orphans=orphans,
+        missing_links=missing,
+        incomplete_pages=incomplete,
+        low_confidence_claims=low_conf,
+    )
+
+    print()
+    print(_LINE)
+    print(f"  orphans:          {len(orphans)} page(s) with no inbound links")
+    print(f"  missing links:    {len(missing)} [[wikilink]] target(s) not found")
+    print(f"  contradictions:   {len(report.contradictions)} pair(s) flagged")
+    print(f"  incomplete pages: {len(incomplete)}")
+    print(f"  low-confidence:   {len(low_conf)} claim(s)")
+    print(_LINE)
+
+    if not report_only:
+        fixes = apply_fixes(store, report)
+        report.auto_fixed = fixes
+        print(f"  auto-fixed:       {len(fixes)}")
+
+    # Write lint-report.md
+    lint_report_path = store.wiki / "lint-report.md"
+    needs_review = report.contradictions
+    lines = [
+        "# Lint Report\n",
+        f"## Summary\n",
+        f"- orphans: {len(orphans)}",
+        f"- missing links: {len(missing)}",
+        f"- contradictions: {len(report.contradictions)}",
+        f"- incomplete pages: {len(incomplete)}",
+        f"- low-confidence claims: {len(low_conf)}",
+        f"- auto-fixed: {len(report.auto_fixed)}",
+        "",
+    ]
+    if needs_review:
+        lines.append("## Needs Review\n")
+        for a, b in needs_review:
+            lines.append(f"- {a} vs {b}")
+    lint_report_path.write_text("\n".join(lines), encoding="utf-8")
+
+    if needs_review:
+        print(f"  needs review:     {len(needs_review)} contradiction(s)  → {lint_report_path}")
+    print()
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     store = WikiStore()
     if args.quarantine:
@@ -679,6 +752,14 @@ def main() -> None:
         help="Also include PENDING (unreviewed) claims",
     )
 
+    # lint
+    lint_p = sub.add_parser("lint", help="Audit and auto-fix the wiki knowledge graph")
+    lint_p.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Only report issues — do not apply any fixes or commit changes",
+    )
+
     # list
     list_p = sub.add_parser("list", help="List wiki claims")
     list_p.add_argument("--quarantine", action="store_true", help="Show quarantined claims")
@@ -719,6 +800,8 @@ def main() -> None:
         cmd_list(args)
     elif args.command == "clear":
         cmd_clear(args)
+    elif args.command == "lint":
+        cmd_lint(args)
     else:
         parser.print_help()
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 
-from ..models import Claim, ClaimStatus, TrustLevel
+from ..models import Claim, ClaimStatus, TrustLevel, WikiPage
 from ..prompts import CONTEXT_SYSTEM_NOTE, strip_trust_markers
 from ..store.wiki_store import WikiStore
 
@@ -62,6 +62,11 @@ def load_for_context(
     nonce = secrets.token_hex(8)
     system_note = CONTEXT_SYSTEM_NOTE.format(nonce=nonce)
     body = _format_claims(claims)
+
+    wiki_section = _format_wiki_pages(_store)
+    if wiki_section:
+        body = body + "\n\n# Wiki Pages\n\n" + wiki_section
+
     context_block = f"<wiki-context-{nonce}>\n{body}</wiki-context-{nonce}>"
 
     return WikiContext(
@@ -78,6 +83,27 @@ def _trust_symbol(level: TrustLevel) -> str:
         TrustLevel.SEMI_TRUSTED: "S",
         TrustLevel.UNTRUSTED: "U",
     }[level]
+
+
+def _format_wiki_pages(store: WikiStore) -> str:
+    """Load all wiki pages and return a formatted summary section."""
+    if not store.wiki.exists():
+        return ""
+    lines: list[str] = []
+    for subdir in ("concepts", "entities", "summaries"):
+        d = store.wiki / subdir
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*.md")):
+            try:
+                page = WikiPage.from_file(p)
+                truncated = page.body[:400].replace("\n", " ")
+                lines.append(f"## {page.title} ({page.page_type})")
+                lines.append(truncated)
+                lines.append("")
+            except Exception:
+                pass
+    return "\n".join(lines)
 
 
 def _format_claims(claims: list[Claim]) -> str:

@@ -12,8 +12,11 @@ import hashlib
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 import uuid
+
+import yaml
 
 
 class TrustLevel(str, Enum):
@@ -96,3 +99,66 @@ class Claim:
             supersedes=d.get("supersedes"),
             review_notes=d.get("review_notes"),
         )
+
+
+@dataclass
+class WikiPage:
+    """A structured wiki page (summary, concept, or entity) with YAML frontmatter."""
+    slug: str
+    page_type: str          # "summary" | "concept" | "entity"
+    title: str
+    tags: list[str]
+    confidence: str         # "high" | "medium" | "low"
+    sources: list[str]
+    body: str
+    created: str            # ISO date
+    updated: str            # ISO date
+
+    def to_markdown(self) -> str:
+        fm = yaml.dump(
+            {
+                "confidence": self.confidence,
+                "created": self.created,
+                "slug": self.slug,
+                "sources": self.sources,
+                "tags": self.tags,
+                "title": self.title,
+                "type": self.page_type,
+                "updated": self.updated,
+            },
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=True,
+        )
+        return f"---\n{fm}---\n\n{self.body}\n"
+
+    @classmethod
+    def from_file(cls, path: Path) -> "WikiPage":
+        text = path.read_text(encoding="utf-8")
+        parts = text.split("---\n", 2)
+        if len(parts) < 3:
+            raise ValueError(f"missing frontmatter in {path}")
+        raw = yaml.safe_load(parts[1])
+        body = parts[2].strip()
+        return cls(
+            slug=raw.get("slug", path.stem),
+            page_type=raw.get("type", "concept"),
+            title=raw.get("title", path.stem),
+            tags=raw.get("tags", []),
+            confidence=raw.get("confidence", ""),
+            sources=raw.get("sources", []),
+            body=body,
+            created=raw.get("created", ""),
+            updated=raw.get("updated", ""),
+        )
+
+
+@dataclass
+class LintReport:
+    """Result of a wiki lint run."""
+    orphans: list[str] = field(default_factory=list)
+    missing_links: list[str] = field(default_factory=list)
+    contradictions: list[tuple[str, str]] = field(default_factory=list)
+    incomplete_pages: list[str] = field(default_factory=list)
+    low_confidence_claims: list[str] = field(default_factory=list)
+    auto_fixed: list[str] = field(default_factory=list)
