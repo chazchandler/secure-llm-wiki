@@ -333,6 +333,7 @@ def _run_pipeline(
     new_embeddings: dict[str, list[float]] = {}
     try:
         embed_client = get_embed_client()
+        first_embed_error: Exception | None = None
         with _spinner(f"[embed]    computing embeddings for {len(claims)} claim(s)…"):
             with ThreadPoolExecutor() as pool:
                 futures = {pool.submit(embed_client.embed, c.text): c.claim_id for c in claims}
@@ -340,9 +341,16 @@ def _run_pipeline(
                     cid = futures[fut]
                     try:
                         new_embeddings[cid] = fut.result()
-                    except Exception:
-                        pass
-        print(f"[embed]    {len(new_embeddings)}/{len(claims)} embedding(s) computed")
+                    except Exception as e:
+                        if first_embed_error is None:
+                            first_embed_error = e
+        if first_embed_error is not None and not new_embeddings:
+            print(f"[embed]    0/{len(claims)} computed — error: {first_embed_error}")
+            print(f"[embed]    Gate 5 falls back to section heuristic")
+        elif first_embed_error is not None:
+            print(f"[embed]    {len(new_embeddings)}/{len(claims)} embedding(s) computed (some failed: {first_embed_error})")
+        else:
+            print(f"[embed]    {len(new_embeddings)}/{len(claims)} embedding(s) computed")
     except Exception as exc:
         print(f"[embed]    unavailable ({exc}), Gate 5 falls back to section heuristic")
 
