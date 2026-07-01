@@ -23,6 +23,7 @@ Every layer enforces this trust boundary.
 ```
 Source → [1] Ingestion      data/instruction separation + sanitizing
        → [2] Extraction     atomic claims + provenance (LLM, nonce-delimited)
+       →    ( Human Review )  optional --review: validate/correct claims, log corrections
        → [3] Trust-Tiering  weakest level propagates; URI-pattern registry
        → [4] Adversarial Review  independent second model, 4-eyes principle
        → [5] Write-Gate     sanitizing · provenance · trust · review · consistency
@@ -43,7 +44,7 @@ secure-llm-wiki/
 ├── .env.example                 # LLM and wiki path config template
 ├── src/secure_wiki/
 │   ├── __main__.py              # CLI: ingest · list · context · query · init ✅
-│   ├── models.py                # Claim / SourceRef / TrustLevel — provenance schema ✅
+│   ├── models.py                # Claim / SourceRef / Correction / TrustLevel — provenance schema ✅
 │   ├── llm_client.py            # Ollama + Anthropic provider abstraction, token usage ✅
 │   ├── prompts.py               # All system prompts, nonce-delimiter builders ✅
 │   ├── ingestion/
@@ -53,7 +54,8 @@ secure-llm-wiki/
 │   ├── trust/
 │   │   └── tiering.py           # URI-pattern registry, user rules via trust_rules.yaml ✅
 │   ├── review/
-│   │   └── adversarial.py       # Independent review model, JSON verdict, fail-closed ✅
+│   │   ├── adversarial.py       # Independent review model, JSON verdict, fail-closed ✅
+│   │   └── interactive.py       # Optional human validate/correct step (--review) ✅
 │   ├── gate/
 │   │   └── write_gate.py        # 5-gate orchestration: commit / quarantine / escalate ✅
 │   ├── store/
@@ -73,6 +75,7 @@ secure-llm-wiki/
 └── wiki_data/                   # Separate git repo, created on first run (gitignored here)
     ├── pages/                   # Committed (ACTIVE) claims
     ├── quarantine/              # QUARANTINED / PENDING claims
+    ├── corrections/            # Human corrections from --review (source reconciliation record)
     └── trust_rules.yaml         # User-editable trust rules
 ```
 
@@ -115,6 +118,12 @@ secure-wiki ingest path/to/docs/ --recursive     # include sub-folders
 
 # Override trust level manually (skips the interactive prompt)
 secure-wiki ingest report.txt --trust semi-trusted --source-id vendor-advisory-2026
+
+# Interactively validate/correct each extracted claim before it is embedded.
+# Off by default so ingestion stays non-interactive; requires a TTY.
+# Per claim: [a]ccept · [e]dit text · [d]rop · [A]ccept all remaining · [q]uit review.
+# Edits/drops are saved to wiki_data/corrections/ so the original source can be reconciled later.
+secure-wiki ingest path/to/document.txt --review
 
 # List committed claims
 secure-wiki list
@@ -178,6 +187,11 @@ Every pipeline layer enforces a single invariant: untrusted input never reaches 
 
 ### 4-eyes principle
 Extraction and review use **different models** by default. With Ollama: `llama3.1:8b` (extraction) and `mistral` (review). With Anthropic: `claude-haiku-4-5` (extraction) and `claude-sonnet-4-6` (review). A jailbreak that compromises the extractor must not simultaneously compromise the reviewer.
+
+### Human-in-the-loop review (optional)
+`ingest --review` inserts a human checkpoint between extraction and embedding. Each extracted claim can be accepted, edited, or dropped before it is embedded and committed — corrected text is what flows downstream through the write-gate and into the wiki. The flag is opt-in: without it, ingestion runs unattended, and if `--review` is passed without a TTY the step is skipped rather than blocking.
+
+Every edit or drop is persisted as a `Correction` record under `wiki_data/corrections/` (git-committed like claims), pinning the source id, content hash, claim id, original model text, and the human's action. These records are the durable link back to the originating document, so the **original source can later be reconciled** with the reviewed knowledge — the corrections survive independently of the claim itself.
 
 ### Fail-closed
 Unparseable LLM responses are treated as failures — empty extraction returns no claims, unparseable review verdict blocks the write. The system never silently passes bad output.

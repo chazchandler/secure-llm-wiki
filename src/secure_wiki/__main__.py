@@ -48,6 +48,7 @@ from .lint.fixer import apply_fixes
 from .llm_client import UsageInfo
 from .models import LintReport
 from .review.adversarial import review_write
+from .review.interactive import is_interactive_capable, review_claims_interactive
 from .gate.write_gate import GateDecision, run_write_gate
 from .ingestion.sanitizer import sanitize
 from .llm_client import get_embed_client, get_review_client
@@ -277,6 +278,7 @@ def _run_pipeline(
     existing: list,
     existing_embeddings: dict,
     sim_cfg: dict,
+    interactive: bool = False,
 ) -> tuple[int, int, int, UsageInfo]:
     """Run steps 1–6 of the ingest pipeline for a single source.
 
@@ -328,6 +330,23 @@ def _run_pipeline(
         return 0, 0, 0, extract_usage
     print(f"[extract]  {len(claims)} claim(s) extracted")
     print()
+
+    # 5b. Optional interactive validation/correction (opt-in via --review).
+    # Runs after extraction and before embedding so corrected text is what gets
+    # embedded and committed. Corrections are persisted to reconcile the source.
+    if interactive:
+        if not is_interactive_capable():
+            print("[review]   --review requested but no TTY available — skipping (non-interactive)")
+        else:
+            claims, corrections = review_claims_interactive(claims)
+            for corr in corrections:
+                store.save_correction(corr)
+            if corrections:
+                print(f"[review]   {len(corrections)} correction(s) saved → {store.corrections}")
+            if not claims:
+                print("[review]   all claims dropped — nothing to embed")
+                return 0, 0, 0, extract_usage
+            print()
 
     # 6. Embeddings — computed in parallel
     new_embeddings: dict[str, list[float]] = {}
@@ -474,6 +493,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             args.source_id if not is_folder else None,
             args.section,
             store, emb_store, existing, existing_embeddings, sim_cfg,
+            interactive=getattr(args, "review", False),
         )
         total_committed += c
         total_quarantined += q
@@ -730,6 +750,11 @@ def main() -> None:
     ingest_p.add_argument(
         "--recursive", action="store_true",
         help="When source is a folder, also scan sub-folders",
+    )
+    ingest_p.add_argument(
+        "--review", action="store_true",
+        help="Interactively validate/correct each extracted claim before "
+             "embedding; corrections are saved to reconcile source docs later",
     )
 
     # query

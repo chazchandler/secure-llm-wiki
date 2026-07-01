@@ -23,7 +23,7 @@ from pathlib import Path
 
 import yaml
 
-from ..models import Claim, ClaimStatus, WikiPage
+from ..models import Claim, ClaimStatus, Correction, WikiPage
 
 _TRUST_RULES_TEMPLATE = """\
 # Trust rules for this wiki instance.
@@ -96,6 +96,7 @@ class WikiStore:
         self.pages = self.root / "pages"
         self.quarantine = self.root / "quarantine"
         self.sources = self.root / "sources"
+        self.corrections = self.root / "corrections"
         self.wiki = self.root / "wiki"
 
     # ------------------------------------------------------------------
@@ -107,6 +108,7 @@ class WikiStore:
         self.pages.mkdir(parents=True, exist_ok=True)
         self.quarantine.mkdir(parents=True, exist_ok=True)
         self.sources.mkdir(parents=True, exist_ok=True)
+        self.corrections.mkdir(parents=True, exist_ok=True)
         (self.wiki / "summaries").mkdir(parents=True, exist_ok=True)
         (self.wiki / "concepts").mkdir(parents=True, exist_ok=True)
         (self.wiki / "entities").mkdir(parents=True, exist_ok=True)
@@ -195,6 +197,53 @@ class WikiStore:
         path.write_text(f"---\n{frontmatter}---\n\n{text}\n", encoding="utf-8")
         self._commit(path, f"add source {source_id} [{trust_level}] from {uri}")
         return path
+
+    def save_correction(self, correction: Correction) -> Path:
+        """Persist an interactive-review correction and commit it.
+
+        Stored one-file-per-correction under corrections/ so the record set can
+        later drive reconciliation of the original source document. The body
+        keeps the original and corrected text human-readable in ``git diff``.
+        """
+        self._ensure_init()
+        self.corrections.mkdir(parents=True, exist_ok=True)
+        path = self.corrections / f"{correction.claim_id}.md"
+        frontmatter = yaml.dump(
+            correction.to_dict(),
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=True,
+        )
+        body = f"## original\n\n{correction.original_text}\n"
+        if correction.action == "edit":
+            body += f"\n## corrected\n\n{correction.corrected_text}\n"
+        else:
+            body += "\n## corrected\n\n(dropped — claim removed before embedding)\n"
+        if correction.note:
+            body += f"\n## note\n\n{correction.note}\n"
+        path.write_text(f"---\n{frontmatter}---\n\n{body}", encoding="utf-8")
+        self._commit(
+            path,
+            f"correct {correction.claim_id[:8]} [{correction.action}] "
+            f"from {correction.source_uri}",
+        )
+        return path
+
+    def load_corrections(self, source_id: str | None = None) -> list[Correction]:
+        """Load stored corrections, optionally filtered to one source_id."""
+        if not self.corrections.exists():
+            return []
+        out: list[Correction] = []
+        for path in sorted(self.corrections.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            parts = text.split("---\n", 2)
+            if len(parts) < 3:
+                continue
+            raw = yaml.safe_load(parts[1])
+            corr = Correction.from_dict(raw)
+            if source_id is None or corr.source_id == source_id:
+                out.append(corr)
+        return out
 
     _PAGE_SUBDIR = {"summary": "summaries", "concept": "concepts", "entity": "entities"}
 

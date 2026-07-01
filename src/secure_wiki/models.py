@@ -102,6 +102,48 @@ class Claim:
 
 
 @dataclass
+class Correction:
+    """A human correction to an extracted claim, captured during interactive
+    review (``ingest --review``) before the claim is embedded.
+
+    Corrections are persisted independently of the claim so the *original*
+    source document can later be reconciled with the reviewed knowledge. Each
+    record pins the source (``source_id`` + ``content_hash``) the claim was
+    extracted from, the original model-produced text, and the human's action.
+    """
+    source_id: str
+    source_uri: str
+    section: str
+    content_hash: str          # hash of the source doc the claim came from
+    claim_id: str
+    action: str                # "edit" | "drop"
+    original_text: str         # the claim text as the model extracted it
+    corrected_text: Optional[str] = None  # None for a dropped claim
+    note: Optional[str] = None            # reviewer's rationale
+    corrected_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Correction":
+        return cls(
+            source_id=d["source_id"],
+            source_uri=d["source_uri"],
+            section=d["section"],
+            content_hash=d["content_hash"],
+            claim_id=d["claim_id"],
+            action=d["action"],
+            original_text=d["original_text"],
+            corrected_text=d.get("corrected_text"),
+            note=d.get("note"),
+            corrected_at=d.get("corrected_at", ""),
+        )
+
+
+@dataclass
 class WikiPage:
     """A structured wiki page (summary, concept, or entity) with YAML frontmatter."""
     slug: str
