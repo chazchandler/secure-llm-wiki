@@ -97,6 +97,13 @@ v0.1 specification. In short:
 - **`log.md`** groups ingest history under `## YYYY-MM-DD` headings, newest
   first, as `* **<kind>**: <entry>` lines.
 
+A bundle created before this format was adopted can be upgraded in place — the
+migration is idempotent and commits each step to the wiki repo:
+
+```bash
+python -m secure_wiki.store.migrate_okf        # defaults to $WIKI_DATA_PATH / wiki_data
+```
+
 ## Setup
 
 ```bash
