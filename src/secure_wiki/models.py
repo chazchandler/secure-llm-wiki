@@ -73,6 +73,10 @@ class Claim:
     gates_passed: list[str] = field(default_factory=list)
     supersedes: Optional[str] = None
     review_notes: Optional[str] = None
+    # How a non-commit gate finding (QUARANTINE/ESCALATE) was manually resolved.
+    # None means the finding has not been reviewed yet ("unaddressed"). Set by
+    # interactive findings review to "committed" | "kept" | "dropped".
+    resolution: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -98,6 +102,7 @@ class Claim:
             gates_passed=d.get("gates_passed", []),
             supersedes=d.get("supersedes"),
             review_notes=d.get("review_notes"),
+            resolution=d.get("resolution"),
         )
 
 

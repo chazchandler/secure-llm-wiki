@@ -3,11 +3,12 @@ from unittest.mock import patch
 
 import pytest
 
-from secure_wiki.__main__ import _run_pipeline
+from secure_wiki.__main__ import _resolve_findings, _run_pipeline
 from secure_wiki.llm_client import UsageInfo
 from secure_wiki.models import Claim, ClaimStatus, SourceRef, TrustLevel
 from secure_wiki.review.adversarial import ReviewResult
-from secure_wiki.gate.write_gate import GateDecision
+from secure_wiki.review.interactive import Decision
+from secure_wiki.gate.write_gate import GateDecision, GateOutcome
 from secure_wiki.store.wiki_store import WikiStore
 from secure_wiki.store.embedding_store import EmbeddingStore
 
@@ -67,3 +68,95 @@ def test_pipeline_calls_enrich_after_gate_loop(tmp_path, monkeypatch):
 
     assert len(enrich_calls) == 1
     assert enrich_calls[0][0].text == claim.text
+
+
+def _store(tmp_path):
+    store = WikiStore(root=tmp_path / "wiki")
+    store.init()
+    return store, EmbeddingStore(store)
+
+
+def test_resolve_findings_non_interactive_quarantines_all(tmp_path):
+    """Default (no TTY) path writes every finding to quarantine, unaddressed."""
+    store, emb = _store(tmp_path)
+    pending = [
+        GateOutcome(GateDecision.QUARANTINE, _make_claim("dup"), "consistency: duplicate"),
+        GateOutcome(GateDecision.ESCALATE, _make_claim("conflict"), "consistency: similar"),
+    ]
+    c, q, e = _resolve_findings(
+        pending, interactive=False, store=store, emb_store=emb,
+        new_embeddings={}, existing=[], existing_embeddings={}, committed_ids=set(),
+    )
+    assert (c, q, e) == (0, 1, 1)
+    quarantined = store.load_quarantined()
+    assert len(quarantined) == 2
+    assert all(qc.resolution is None for qc in quarantined)  # unaddressed
+
+
+def test_resolve_findings_interactive_commit_and_keep(tmp_path, monkeypatch):
+    """Under --review: commit overrides the gate; keep stays quarantined, marked."""
+    store, emb = _store(tmp_path)
+    dup = _make_claim("commit this duplicate")
+    conflict = _make_claim("keep this conflict")
+    pending = [
+        GateOutcome(GateDecision.QUARANTINE, dup, "consistency: duplicate of abcd"),
+        GateOutcome(GateDecision.ESCALATE, conflict, "consistency: similar to ef01"),
+    ]
+
+    monkeypatch.setattr("secure_wiki.__main__.is_interactive_capable", lambda: True)
+    monkeypatch.setattr(
+        "secure_wiki.__main__.review_findings_interactive",
+        lambda findings, **kw: ([Decision("commit"), Decision("keep")], True),
+    )
+
+    committed_ids: set = set()
+    c, q, e = _resolve_findings(
+        pending, interactive=True, store=store, emb_store=emb,
+        new_embeddings={}, existing=[], existing_embeddings={}, committed_ids=committed_ids,
+    )
+    assert (c, q, e) == (1, 0, 1)
+
+    active = store.load_claims()
+    assert [a.text for a in active] == ["commit this duplicate"]
+    assert active[0].resolution == "committed"
+    assert dup.claim_id in committed_ids
+
+    quarantined = store.load_quarantined()
+    assert [qc.text for qc in quarantined] == ["keep this conflict"]
+    assert quarantined[0].resolution == "kept"
+
+
+def test_resolve_findings_interactive_edit_and_drop(tmp_path, monkeypatch):
+    """Edit rewrites text before committing; drop discards without storing."""
+    store, emb = _store(tmp_path)
+    to_edit = _make_claim("typo in claim")
+    to_drop = _make_claim("hallucinated claim")
+    pending = [
+        GateOutcome(GateDecision.ESCALATE, to_edit, "consistency: similar"),
+        GateOutcome(GateDecision.QUARANTINE, to_drop, "consistency: duplicate"),
+    ]
+
+    monkeypatch.setattr("secure_wiki.__main__.is_interactive_capable", lambda: True)
+    monkeypatch.setattr("secure_wiki.__main__._safe_embed", lambda _t: None)
+    monkeypatch.setattr(
+        "secure_wiki.__main__.review_findings_interactive",
+        lambda findings, **kw: (
+            [Decision("edit", new_text="corrected claim", note="fixed typo"),
+             Decision("drop", note="not real")],
+            True,
+        ),
+    )
+
+    c, q, e = _resolve_findings(
+        pending, interactive=True, store=store, emb_store=emb,
+        new_embeddings={}, existing=[], existing_embeddings={}, committed_ids=set(),
+    )
+    assert (c, q, e) == (1, 0, 0)
+
+    active = store.load_claims()
+    assert [a.text for a in active] == ["corrected claim"]
+    assert store.load_quarantined() == []
+
+    # Both the edit and the drop are preserved as corrections for source reconciliation.
+    corrections = store.load_corrections()
+    assert sorted(cr.action for cr in corrections) == ["drop", "edit"]

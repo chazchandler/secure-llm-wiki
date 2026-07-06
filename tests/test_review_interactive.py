@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 from secure_wiki.models import Claim, SourceRef, TrustLevel
-from secure_wiki.review.interactive import review_claims_interactive
+from secure_wiki.review.interactive import (
+    Decision,
+    NEXT,
+    review_claims_interactive,
+    review_findings_interactive,
+    run_review_session,
+)
 from secure_wiki.store.wiki_store import WikiStore
 
 
@@ -105,3 +111,88 @@ def test_correction_roundtrip_through_store(tmp_path):
     # Filtering by source_id
     assert store.load_corrections(source_id="doc") == loaded
     assert store.load_corrections(source_id="other") == []
+
+
+# ------------------------------------------------------------------
+# Back-navigation
+# ------------------------------------------------------------------
+
+def test_previous_lets_earlier_decision_be_revised():
+    claims = [_claim("one"), _claim("two")]
+    # accept #1 → go to #2 → [p]revious back to #1 → edit it → drop #2.
+    kept, corrections = review_claims_interactive(
+        claims,
+        input_fn=_scripted(["a", "p", "e", "revised", "", "d", ""]),
+        out=lambda _m: None,
+    )
+    assert [c.text for c in kept] == ["revised"]
+    actions = sorted(c.action for c in corrections)
+    assert actions == ["drop", "edit"]
+    edit = next(c for c in corrections if c.action == "edit")
+    assert edit.original_text == "one" and edit.corrected_text == "revised"
+
+
+def test_engine_requires_all_and_jumps_back_to_unresolved():
+    seen: list[int] = []
+
+    def decide(i: int, prior):
+        seen.append(i)
+        # Skip item 0 the first time (leave it undecided); decide everything else.
+        if i == 0 and seen.count(0) == 1:
+            return NEXT
+        return Decision("ok")
+
+    decisions, completed = run_review_session(
+        2, decide, out=lambda _m: None, require_all=True
+    )
+    assert completed
+    assert all(d is not None for d in decisions)
+    # It must have come back to item 0 after reaching the end.
+    assert seen.count(0) == 2
+
+
+# ------------------------------------------------------------------
+# Findings review (non-commit resolutions)
+# ------------------------------------------------------------------
+
+def _finding(text: str, kind: str = "ESCALATE"):
+    return (_claim(text), kind, f"consistency: similar to abcd1234 — {kind}")
+
+
+def test_findings_keep_commit_edit_drop():
+    findings = [
+        _finding("keep me", "QUARANTINE"),
+        _finding("commit me"),
+        _finding("edit me"),
+        _finding("drop me", "QUARANTINE"),
+    ]
+    decisions, completed = review_findings_interactive(
+        findings,
+        input_fn=_scripted(
+            ["k", "c", "", "e", "fixed text", "note", "d", ""]
+        ),
+        out=lambda _m: None,
+    )
+    assert completed
+    assert [d.action for d in decisions] == ["keep", "commit", "edit", "drop"]
+    assert decisions[2].new_text == "fixed text"
+
+
+def test_findings_force_quit_leaves_unaddressed():
+    findings = [_finding("a"), _finding("b")]
+    # Quit immediately, confirm "y" to abandon.
+    decisions, completed = review_findings_interactive(
+        findings, input_fn=_scripted(["q", "y"]), out=lambda _m: None
+    )
+    assert completed is False
+    assert decisions == [None, None]
+
+
+def test_findings_declining_quit_forces_resolution():
+    findings = [_finding("a"), _finding("b")]
+    # At #2 try to quit, decline ("n"), then keep both.
+    decisions, completed = review_findings_interactive(
+        findings, input_fn=_scripted(["k", "q", "n", "k"]), out=lambda _m: None
+    )
+    assert completed
+    assert [d.action for d in decisions] == ["keep", "keep"]

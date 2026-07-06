@@ -48,11 +48,16 @@ from .lint.fixer import apply_fixes
 from .llm_client import UsageInfo
 from .models import LintReport
 from .review.adversarial import review_write
-from .review.interactive import is_interactive_capable, review_claims_interactive
+from .review.interactive import (
+    is_interactive_capable,
+    make_correction,
+    review_claims_interactive,
+    review_findings_interactive,
+)
 from .gate.write_gate import GateDecision, run_write_gate
 from .ingestion.sanitizer import sanitize
 from .llm_client import get_embed_client, get_review_client
-from .models import SourceRef, TrustLevel
+from .models import ClaimStatus, SourceRef, TrustLevel
 from .prompts import QUERY_TASK_PROMPT
 from .read.hygiene import load_for_context
 from .store.embedding_store import EmbeddingStore
@@ -268,6 +273,97 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"Wiki repo initialized at {store.root.resolve()}")
 
 
+def _safe_embed(text: str) -> list[float] | None:
+    """Best-effort single embedding; returns None if embeddings are unavailable."""
+    try:
+        return get_embed_client().embed(text)
+    except Exception:
+        return None
+
+
+def _resolve_findings(
+    pending: list,
+    interactive: bool,
+    store: WikiStore,
+    emb_store: EmbeddingStore,
+    new_embeddings: dict,
+    existing: list,
+    existing_embeddings: dict,
+    committed_ids: set,
+) -> tuple[int, int, int]:
+    """Store or interactively resolve non-commit gate outcomes.
+
+    Default (non-interactive): every finding is written to quarantine as before,
+    unaddressed (resolution=None). Under --review with a TTY, the reviewer must
+    resolve each finding — keep / commit / edit / drop — so none are left
+    unaddressed. Returns (committed_delta, quarantined, escalated).
+    """
+    if not (interactive and is_interactive_capable()):
+        if interactive:
+            print("[review]   --review requested but no TTY available — findings left quarantined")
+        q = e = 0
+        for outcome in pending:
+            store.save_quarantined(outcome.claim, outcome.detail)
+            if outcome.decision == GateDecision.QUARANTINE:
+                q += 1
+            else:
+                e += 1
+        return 0, q, e
+
+    findings = [
+        (
+            o.claim,
+            "QUARANTINE" if o.decision == GateDecision.QUARANTINE else "ESCALATE",
+            o.detail,
+        )
+        for o in pending
+    ]
+    decisions, completed = review_findings_interactive(findings)
+    if not completed:
+        print("[review]   finished with unaddressed finding(s) — left quarantined")
+
+    committed = quarantined = escalated = 0
+    for outcome, dec in zip(pending, decisions):
+        claim = outcome.claim
+        action = dec.action if dec is not None else "keep"  # undecided → keep
+        note = dec.note if dec is not None else None
+
+        if action == "drop":
+            store.save_correction(make_correction(claim, "drop", None, note))
+            print(f"[review]   drop     {claim.claim_id[:8]}  {outcome.detail}")
+            continue
+
+        if action == "keep":
+            claim.resolution = None if dec is None else "kept"
+            store.save_quarantined(claim, outcome.detail)
+            if outcome.decision == GateDecision.QUARANTINE:
+                quarantined += 1
+            else:
+                escalated += 1
+            continue
+
+        # commit or edit → promote to the wiki (human override of the gate)
+        if action == "edit" and dec is not None and dec.new_text and dec.new_text != claim.text:
+            store.save_correction(make_correction(claim, "edit", dec.new_text, note))
+            claim.text = dec.new_text
+            new_embeddings[claim.claim_id] = _safe_embed(claim.text) or new_embeddings.get(claim.claim_id)
+        if note:
+            claim.review_notes = f"{claim.review_notes}; {note}" if claim.review_notes else note
+        claim.status = ClaimStatus.ACTIVE
+        claim.resolution = "committed"
+        store.save_claim(claim, gate_detail=f"human override: {outcome.detail}")
+        existing.append(claim)
+        committed_ids.add(claim.claim_id)
+        emb = new_embeddings.get(claim.claim_id)
+        if emb is not None:
+            emb_store.save(claim.claim_id, emb)
+            existing_embeddings[claim.claim_id] = emb
+        committed += 1
+        print(f"[review]   commit   {claim.claim_id[:8]}  {_preview(claim.text)}")
+
+    return committed, quarantined, escalated
+
+
 def _run_pipeline(
     source: str,
     trust: TrustLevel,
@@ -388,9 +484,13 @@ def _run_pipeline(
     print(f"[review]   {status}  {'; '.join(batch_review.reasons) if batch_review.reasons else 'no issues'}")
     print()
 
-    # 8. Gate + store (review result pre-supplied — no extra LLM call per claim)
+    # 8. Gate (review result pre-supplied — no extra LLM call per claim).
+    # COMMIT outcomes are stored immediately so later claims in this batch
+    # dedupe against them; non-commit outcomes (QUARANTINE/ESCALATE) are
+    # deferred so they can be resolved together in step 8b.
     committed = quarantined = escalated = 0
     committed_ids: set[str] = set()
+    pending: list = []  # non-commit GateOutcomes awaiting resolution/storage
     width = len(f"[gate {len(claims)}/{len(claims)}]") + 2
 
     for i, claim in enumerate(claims, 1):
@@ -416,13 +516,22 @@ def _run_pipeline(
             committed += 1
             print(f"{label} COMMIT      {_preview(claim.text)}")
         elif outcome.decision == GateDecision.QUARANTINE:
-            store.save_quarantined(claim, outcome.detail)
-            quarantined += 1
+            pending.append(outcome)
             print(f"{label} QUARANTINE  {outcome.detail}")
         else:
-            store.save_quarantined(claim, outcome.detail)
-            escalated += 1
+            pending.append(outcome)
             print(f"{label} ESCALATE    {outcome.detail}")
+
+    # 8b. Resolve non-commit findings — interactively under --review (keep /
+    # commit / edit / drop, none left unaddressed), else store as quarantined.
+    if pending:
+        c2, q2, e2 = _resolve_findings(
+            pending, interactive, store, emb_store,
+            new_embeddings, existing, existing_embeddings, committed_ids,
+        )
+        committed += c2
+        quarantined += q2
+        escalated += e2
 
     # 9. Graph enrichment — runs after all claims are committed
     committed_claims = [c for c in claims if c.claim_id in committed_ids]

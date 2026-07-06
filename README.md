@@ -27,6 +27,7 @@ Source → [1] Ingestion      data/instruction separation + sanitizing
        → [3] Trust-Tiering  weakest level propagates; URI-pattern registry
        → [4] Adversarial Review  independent second model, 4-eyes principle
        → [5] Write-Gate     sanitizing · provenance · trust · review · consistency
+       →    ( Human Review )  optional --review: resolve every quarantine/escalate finding
        → [6] Wiki-Store     Markdown + YAML frontmatter, separate git repo
        → [7] Read-Time Hygiene  nonce-delimited context, trust metadata attached
 ```
@@ -119,9 +120,11 @@ secure-wiki ingest path/to/docs/ --recursive     # include sub-folders
 # Override trust level manually (skips the interactive prompt)
 secure-wiki ingest report.txt --trust semi-trusted --source-id vendor-advisory-2026
 
-# Interactively validate/correct each extracted claim before it is embedded.
+# Interactively validate claims (before embedding) AND resolve every non-commit
+# gate finding (after the write-gate) so none are left unaddressed.
 # Off by default so ingestion stays non-interactive; requires a TTY.
-# Per claim: [a]ccept · [e]dit text · [d]rop · [A]ccept all remaining · [q]uit review.
+# Claims:   [a]ccept · [e]dit · [d]rop · [p]revious · [A]ccept all · [q]finish
+# Findings: [k]eep · [c]ommit anyway · [e]dit & commit · [d]rop · [p]revious · [q]finish
 # Edits/drops are saved to wiki_data/corrections/ so the original source can be reconciled later.
 secure-wiki ingest path/to/document.txt --review
 
@@ -189,9 +192,12 @@ Every pipeline layer enforces a single invariant: untrusted input never reaches 
 Extraction and review use **different models** by default. With Ollama: `llama3.1:8b` (extraction) and `mistral` (review). With Anthropic: `claude-haiku-4-5` (extraction) and `claude-sonnet-4-6` (review). A jailbreak that compromises the extractor must not simultaneously compromise the reviewer.
 
 ### Human-in-the-loop review (optional)
-`ingest --review` inserts a human checkpoint between extraction and embedding. Each extracted claim can be accepted, edited, or dropped before it is embedded and committed — corrected text is what flows downstream through the write-gate and into the wiki. The flag is opt-in: without it, ingestion runs unattended, and if `--review` is passed without a TTY the step is skipped rather than blocking.
+`ingest --review` adds two human checkpoints. Both are opt-in: without the flag ingestion runs unattended, and if a TTY is unavailable the checkpoints are skipped (claim review) or the findings are left quarantined (findings review) rather than blocking.
 
-Every edit or drop is persisted as a `Correction` record under `wiki_data/corrections/` (git-committed like claims), pinning the source id, content hash, claim id, original model text, and the human's action. These records are the durable link back to the originating document, so the **original source can later be reconciled** with the reviewed knowledge — the corrections survive independently of the claim itself.
+1. **Pre-embed claim review** — between extraction and embedding, each extracted claim can be accepted, edited, or dropped. Corrected text is what flows downstream through the write-gate and into the wiki.
+2. **Post-gate findings review** — after the write-gate runs, every non-commit outcome (QUARANTINE / ESCALATE) must be resolved so **none are left unaddressed**: `keep` (accept the gate; stays quarantined, marked reviewed), `commit` (override the gate and promote to the wiki), `edit & commit` (fix the text, then promote), or `drop` (discard entirely). Committed claims record `resolution: committed`; kept ones record `resolution: kept`; an unreviewed finding has no resolution.
+
+Both reviews are navigable — you can step **back** to a previous item to fix a mistake, not only forward. Every edit or drop is persisted as a `Correction` record under `wiki_data/corrections/` (git-committed like claims), pinning the source id, content hash, claim id, original model text, and the human's action. These records are the durable link back to the originating document, so the **original source can later be reconciled** with the reviewed knowledge — the corrections survive independently of the claim itself.
 
 ### Fail-closed
 Unparseable LLM responses are treated as failures — empty extraction returns no claims, unparseable review verdict blocks the write. The system never silently passes bad output.
