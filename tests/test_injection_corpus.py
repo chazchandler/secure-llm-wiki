@@ -73,7 +73,16 @@ class TestFullPipeline:
             if case["category"] == "control"
             else TrustLevel.UNTRUSTED
         )
-        claim = Claim(text="extracted claim text", source=source_ref, trust_level=trust)
+        # Gate 1 now sanitizes the CLAIM's own text (not the whole document). For
+        # cases whose attack must be stopped at the sanitizer, the vector has to be
+        # present in the extracted claim itself — model the realistic outcome where
+        # extraction of a pure-injection source carries the payload into the claim.
+        claim_text = (
+            source_text
+            if case["expected_stop_gate"] == "sanitizing"
+            else "extracted claim text"
+        )
+        claim = Claim(text=claim_text, source=source_ref, trust_level=trust)
 
         # Case 07: simulate existing high-trust content the untrusted claim would overwrite.
         existing_claims: list[Claim] = []

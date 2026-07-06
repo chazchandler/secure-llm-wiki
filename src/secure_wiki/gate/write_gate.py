@@ -4,7 +4,8 @@ A claim is committed only when ALL five gates pass. Conflicts with established
 high-trust content are never auto-resolved — they escalate to human review.
 
 Gates run in sequence (fail-fast):
-  1. Sanitizing passed       — no obfuscation flags from ingestion
+  1. Sanitizing passed       — the claim's own text carries no obfuscation flags
+                               (document-level flags are forensic, not per-claim)
   2. Provenance complete     — source.id, uri, content_hash all set
   3. Trust-tier              — untrusted claim cannot overwrite high-trust content
   4. Adversarial review      — independent model found no manipulation
@@ -18,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from ..ingestion.sanitizer import SanitizeReport
+from ..ingestion.sanitizer import SanitizeReport, sanitize
 from ..models import Claim, ClaimStatus, TrustLevel
 from ..review.adversarial import ReviewResult, review_write
 from ..store.embedding_store import cosine_similarity
@@ -59,6 +60,9 @@ def run_write_gate(
 ) -> GateOutcome:
     """Run all gates in sequence and return a commit/quarantine/escalate decision.
 
+    sanitize_report: document-level ingest scan, retained as forensic context.
+        Gate 1 re-sanitizes the individual claim text rather than gating on this
+        whole-document report (see Gate 1 below).
     existing_claims: active wiki claims used for trust-tier and consistency checks.
     """
     existing = existing_claims or []
@@ -67,12 +71,22 @@ def run_write_gate(
         if c.trust_level == TrustLevel.TRUSTED and c.status == ClaimStatus.ACTIVE
     ]
 
-    # Gate 1: sanitizing
-    if sanitize_report.flags:
+    # Gate 1: sanitizing — evaluate the CLAIM's own text, not the whole source.
+    #
+    # `sanitize_report` is the document-level ingest scan; it is a forensic signal
+    # (logged at ingest, and the full source is handed to the adversarial reviewer
+    # in Gate 4). It must NOT blanket-quarantine every claim just because an
+    # innocuous substring elsewhere in the document tripped a heuristic — e.g. the
+    # prose "isn't a separate system: the …" matching the system-role pattern would
+    # otherwise quarantine all claims extracted from that document. A claim is
+    # quarantined here only if an obfuscation/injection vector survived extraction
+    # into the claim text itself.
+    claim_report = sanitize(claim.text)
+    if claim_report.flags:
         return GateOutcome(
             decision=GateDecision.QUARANTINE,
             claim=claim,
-            detail=f"sanitizing: {', '.join(sanitize_report.flags)}",
+            detail=f"sanitizing: {', '.join(claim_report.flags)}",
         )
     claim.gates_passed.append("sanitizing")
 

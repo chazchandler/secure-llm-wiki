@@ -26,7 +26,10 @@ _INVISIBLE_CODEPOINTS = {
 _INSTRUCTION_PATTERNS = [
     re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.I),
     re.compile(r"disregard\s+(the\s+)?above", re.I),
-    re.compile(r"\bsystem\s*:", re.I),
+    # Role-header prefix (e.g. "system: you are now …"). Anchored to line start
+    # (optional indentation) so ordinary mid-sentence prose such as
+    # "isn't a separate system: the …" does not trip a false positive.
+    re.compile(r"^\s*system\s*:", re.I | re.M),
     re.compile(r"you\s+are\s+now\b", re.I),
     re.compile(r"du\s+bist\s+(jetzt|ab\s+jetzt)\b", re.I),
     re.compile(r"ab\s+jetzt\s+(ignoriere|vertraue)", re.I),
