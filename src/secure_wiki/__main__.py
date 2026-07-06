@@ -3,6 +3,7 @@
 Commands:
   ingest <source>   Run the full pipeline on a file or HTTP URI
   review            Resolve outstanding quarantine/escalate findings interactively
+  reembed           Recompute missing embeddings and re-gate deferred findings
   list              Show active wiki claims (--quarantine for quarantine)
   context           Print wiki content as a safe, nonce-delimited context block
   init              Initialize the wiki repo
@@ -48,7 +49,7 @@ from .lint.checker import (
 from .lint.fixer import apply_fixes
 from .llm_client import UsageInfo
 from .models import LintReport
-from .review.adversarial import review_write
+from .review.adversarial import ReviewResult, review_write
 from .review.interactive import (
     is_interactive_capable,
     make_correction,
@@ -56,7 +57,7 @@ from .review.interactive import (
     review_findings_interactive,
 )
 from .gate.write_gate import GateDecision, run_write_gate
-from .ingestion.sanitizer import sanitize
+from .ingestion.sanitizer import SanitizeReport, sanitize
 from .llm_client import get_embed_client, get_review_client
 from .models import ClaimStatus, SourceRef, TrustLevel
 from .prompts import QUERY_TASK_PROMPT
@@ -552,7 +553,7 @@ def _run_pipeline(
     # COMMIT outcomes are stored immediately so later claims in this batch
     # dedupe against them; non-commit outcomes (QUARANTINE/ESCALATE) are
     # deferred so they can be resolved together in step 8b.
-    committed = quarantined = escalated = 0
+    committed = quarantined = escalated = auto_dropped = 0
     committed_ids: set[str] = set()
     pending: list = []  # non-commit GateOutcomes awaiting resolution/storage
     width = len(f"[gate {len(claims)}/{len(claims)}]") + 2
@@ -567,6 +568,7 @@ def _run_pipeline(
             existing_embeddings=existing_embeddings or None,
             duplicate_threshold=sim_cfg["duplicate_threshold"],
             conflict_threshold=sim_cfg["conflict_threshold"],
+            auto_duplicate_threshold=sim_cfg["auto_duplicate_threshold"],
             review_result=batch_review,
         )
 
@@ -579,12 +581,24 @@ def _run_pipeline(
             committed_ids.add(claim.claim_id)
             committed += 1
             print(f"{label} COMMIT      {_preview(claim.text)}")
+        elif outcome.decision == GateDecision.DISCARD:
+            # Near-identical restatement — auto-resolved, never surfaced. Recorded
+            # as a correction so the source can still be reconciled.
+            store.save_correction(make_correction(
+                claim, "drop", None, f"auto-dropped: {outcome.detail}",
+                related_claim_id=outcome.related_id,
+            ))
+            auto_dropped += 1
+            print(f"{label} AUTO-DROP   {outcome.detail}")
         elif outcome.decision == GateDecision.QUARANTINE:
             pending.append(outcome)
             print(f"{label} QUARANTINE  {outcome.detail}")
         else:
             pending.append(outcome)
             print(f"{label} ESCALATE    {outcome.detail}")
+
+    if auto_dropped:
+        print(f"[gate]     auto-dropped {auto_dropped} near-identical duplicate(s)")
 
     # 8b. Resolve non-commit findings — interactively under --review (keep /
     # commit / edit / drop, none left unaddressed), else store as quarantined.
@@ -758,6 +772,105 @@ def cmd_review(args: argparse.Namespace) -> None:
     print(f"  dropped:   {dropped}")
     remaining = len([c for c, _ in store.load_quarantined_detailed() if c.resolution is None])
     print(f"  unaddressed remaining: {remaining}")
+    print()
+
+
+def cmd_reembed(args: argparse.Namespace) -> None:
+    """Recompute missing embeddings and re-gate deferred consistency findings.
+
+    Recovers claims left embedding-less by an earlier embed-service outage:
+    backfills embeddings for active claims (repairing future dedup) and re-runs
+    Gate 5 on quarantined consistency findings now that vectors exist — clearing
+    the false "embedding unavailable" / old "contradicts N in same section"
+    quarantines, auto-dropping true duplicates, and re-labelling anything still
+    similar for review.
+    """
+    store = WikiStore()
+    emb_store = EmbeddingStore(store)
+    sim_cfg = load_similarity_config()
+
+    active = store.load_claims()
+    existing_embeddings = emb_store.load_all()
+
+    # 1. Backfill embeddings for active claims missing one (repairs future dedup).
+    missing = [c for c in active if c.claim_id not in existing_embeddings]
+    backfilled = failed = 0
+    if missing:
+        with _spinner(f"[reembed]  backfilling {len(missing)} active claim(s)…"):
+            for claim in missing:
+                emb = _safe_embed(claim.text)
+                if emb is None:
+                    failed += 1
+                    continue
+                emb_store.save(claim.claim_id, emb)
+                existing_embeddings[claim.claim_id] = emb
+                backfilled += 1
+    print(f"[reembed]  backfilled {backfilled} active claim(s)"
+          + (f", {failed} still failing" if failed else ""))
+
+    if failed and backfilled == 0 and not existing_embeddings:
+        print("[reembed]  embeddings unavailable — check EMBED_MODEL / Ollama and retry")
+        sys.exit(1)
+
+    # 2. Re-gate quarantined consistency findings now that vectors are available.
+    targets = [
+        (c, d) for c, d in store.load_quarantined_detailed()
+        if c.resolution is None and d.startswith("consistency:")
+    ]
+    if not targets:
+        print("[reembed]  no deferred consistency findings to re-gate")
+        return
+
+    existing = active
+    clean_report = SanitizeReport(cleaned_text="")
+    passed = ReviewResult(passed=True, reasons=[])
+    cleared = dropped = requar = escalated = deferred = 0
+
+    with _spinner(f"[reembed]  re-gating {len(targets)} quarantined finding(s)…"):
+        for claim, _detail in targets:
+            emb = _safe_embed(claim.text)
+            if emb is None:
+                deferred += 1
+                continue
+            claim.gates_passed = []  # avoid duplicate gate labels on re-run
+            outcome = run_write_gate(
+                claim, clean_report, existing,
+                new_embedding=emb,
+                existing_embeddings=existing_embeddings or None,
+                duplicate_threshold=sim_cfg["duplicate_threshold"],
+                conflict_threshold=sim_cfg["conflict_threshold"],
+                auto_duplicate_threshold=sim_cfg["auto_duplicate_threshold"],
+                review_result=passed,
+            )
+            if outcome.decision == GateDecision.COMMIT:
+                claim.resolution = "committed"
+                store.promote_from_quarantine(claim, gate_detail="reembed: consistency cleared")
+                emb_store.save(claim.claim_id, emb)
+                existing.append(claim)
+                existing_embeddings[claim.claim_id] = emb
+                cleared += 1
+            elif outcome.decision == GateDecision.DISCARD:
+                store.save_correction(make_correction(
+                    claim, "drop", None, f"auto-dropped: {outcome.detail}",
+                    related_claim_id=outcome.related_id))
+                store.delete_quarantined_claim(claim.claim_id)
+                dropped += 1
+            elif outcome.decision == GateDecision.ESCALATE:
+                store.save_quarantined(claim, outcome.detail)  # rewrite with real finding
+                escalated += 1
+            else:  # QUARANTINE — a genuine duplicate for human review
+                store.save_quarantined(claim, outcome.detail)
+                requar += 1
+
+    print()
+    print(_LINE)
+    print(f"  re-gated:            {len(targets)}")
+    print(f"  cleared (committed): {cleared}")
+    print(f"  auto-dropped:        {dropped}")
+    print(f"  duplicate (review):  {requar}")
+    print(f"  conflict (review):   {escalated}")
+    if deferred:
+        print(f"  still deferred (no embed): {deferred}")
     print()
 
 
@@ -1000,6 +1113,12 @@ def main() -> None:
         help="Resolve outstanding quarantine/escalate findings from any prior run",
     )
 
+    # reembed
+    sub.add_parser(
+        "reembed",
+        help="Recompute missing embeddings and re-gate deferred consistency findings",
+    )
+
     # query
     query_p = sub.add_parser("query", help="Open an interactive wiki Q&A session")
     query_p.add_argument(
@@ -1070,6 +1189,8 @@ def main() -> None:
         cmd_ingest(args)
     elif args.command == "review":
         cmd_review(args)
+    elif args.command == "reembed":
+        cmd_reembed(args)
     elif args.command == "query":
         cmd_query(args)
     elif args.command == "context":

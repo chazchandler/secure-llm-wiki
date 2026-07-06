@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 
 from secure_wiki import __main__ as m
-from secure_wiki.models import Claim, SourceRef, TrustLevel
+from secure_wiki.models import Claim, ClaimStatus, SourceRef, TrustLevel
 from secure_wiki.review.interactive import (
     Decision,
     NEXT,
@@ -282,3 +282,42 @@ def test_cmd_review_noop_when_nothing_outstanding(tmp_path, monkeypatch, capsys)
     WikiStore(root=root).init()
     m.cmd_review(argparse.Namespace())
     assert "No outstanding findings" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------
+# reembed — recover embedding-less quarantines
+# ------------------------------------------------------------------
+
+def test_cmd_reembed_clears_and_dedupes(tmp_path, monkeypatch):
+    from secure_wiki.store.embedding_store import EmbeddingStore
+
+    root = tmp_path / "wiki"
+    monkeypatch.setenv("WIKI_DATA_PATH", str(root))
+    store = WikiStore(root=root)
+    store.init()
+    emb = EmbeddingStore(store)
+
+    # An active claim with a known embedding.
+    anchor = _claim("anchor fact")
+    anchor.status = ClaimStatus.ACTIVE
+    store.save_claim(anchor)
+    emb.save(anchor.claim_id, [1.0, 0.0])
+
+    # Two embedding-less quarantines deferred by a past outage.
+    cleared = _claim("a genuinely new fact")
+    store.save_quarantined(cleared, "consistency: embedding unavailable — deferred (run `secure-wiki reembed`)")
+    dup = _claim("anchor fact restated")
+    store.save_quarantined(dup, "consistency: embedding unavailable — deferred (run `secure-wiki reembed`)")
+
+    # Deterministic embeddings: 'new fact' is orthogonal to anchor → clears;
+    # 'restated' is identical → auto-dropped.
+    vecs = {"a genuinely new fact": [0.0, 1.0], "anchor fact restated": [1.0, 0.0]}
+    monkeypatch.setattr(m, "_safe_embed", lambda t: vecs.get(t))
+
+    m.cmd_reembed(argparse.Namespace())
+
+    fresh = WikiStore(root=root)
+    active = {c.text for c in fresh.load_claims()}
+    assert active == {"anchor fact", "a genuinely new fact"}
+    assert fresh.load_quarantined() == []  # dup dropped, cleared promoted
+    assert any(c.action == "drop" for c in fresh.load_corrections())

@@ -138,14 +138,20 @@ def assign_trust(uri: str) -> TrustLevel:
 def load_similarity_config(path: Path | None = None) -> dict[str, float]:
     """Load Gate 5 similarity thresholds from trust_rules.yaml.
 
-    Returns a dict with keys 'duplicate_threshold' and 'conflict_threshold'.
-    Falls back to safe defaults if the file or section is missing.
+    Returns a dict with keys 'duplicate_threshold', 'conflict_threshold', and
+    'auto_duplicate_threshold'. Falls back to safe defaults if the file or
+    section is missing.
     """
-    from ..gate.write_gate import DEFAULT_CONFLICT_THRESHOLD, DEFAULT_DUPLICATE_THRESHOLD
+    from ..gate.write_gate import (
+        DEFAULT_AUTO_DUPLICATE_THRESHOLD,
+        DEFAULT_CONFLICT_THRESHOLD,
+        DEFAULT_DUPLICATE_THRESHOLD,
+    )
 
     defaults = {
         "duplicate_threshold": DEFAULT_DUPLICATE_THRESHOLD,
         "conflict_threshold": DEFAULT_CONFLICT_THRESHOLD,
+        "auto_duplicate_threshold": DEFAULT_AUTO_DUPLICATE_THRESHOLD,
     }
     rules_path = path or _rules_file()
     if not rules_path.exists():
@@ -155,4 +161,7 @@ def load_similarity_config(path: Path | None = None) -> dict[str, float]:
     return {
         "duplicate_threshold": float(cfg.get("duplicate_threshold", defaults["duplicate_threshold"])),
         "conflict_threshold": float(cfg.get("conflict_threshold", defaults["conflict_threshold"])),
+        "auto_duplicate_threshold": float(
+            cfg.get("auto_duplicate_threshold", defaults["auto_duplicate_threshold"])
+        ),
     }

@@ -48,7 +48,8 @@ def test_pipeline_calls_enrich_after_gate_loop(tmp_path, monkeypatch):
     emb_store = EmbeddingStore(store)
     existing = []
     existing_embeddings = {}
-    sim_cfg = {"duplicate_threshold": 0.95, "conflict_threshold": 0.85}
+    sim_cfg = {"duplicate_threshold": 0.95, "conflict_threshold": 0.85,
+               "auto_duplicate_threshold": 0.97}
 
     with patch("secure_wiki.__main__.extract_claims", return_value=([claim], UsageInfo(), None)), \
          patch("secure_wiki.__main__.review_write", return_value=_pass), \

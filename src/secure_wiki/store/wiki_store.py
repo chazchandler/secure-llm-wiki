@@ -39,9 +39,11 @@ _TRUST_RULES_TEMPLATE = """\
 rules: []
 
 # Gate 5 similarity thresholds (embedding-based duplicate/conflict detection).
-# duplicate_threshold: cosine similarity >= this → quarantine as duplicate
-# conflict_threshold:  cosine similarity >= this → escalate for human review
+# auto_duplicate_threshold: cosine similarity >= this → auto-drop (no review)
+# duplicate_threshold:      cosine similarity >= this → quarantine as duplicate
+# conflict_threshold:       cosine similarity >= this → escalate for human review
 similarity:
+  auto_duplicate_threshold: 0.97
   duplicate_threshold: 0.95
   conflict_threshold: 0.85
 """

@@ -26,12 +26,16 @@ from ..store.embedding_store import cosine_similarity
 # Thresholds — overridable via trust_rules.yaml (loaded by caller)
 DEFAULT_DUPLICATE_THRESHOLD = 0.95
 DEFAULT_CONFLICT_THRESHOLD = 0.85
+# At/above this similarity a claim is a near-identical restatement that adds no
+# information; it is auto-dropped rather than surfaced for review.
+DEFAULT_AUTO_DUPLICATE_THRESHOLD = 0.97
 
 
 class GateDecision(str, Enum):
     COMMIT = "commit"
     QUARANTINE = "quarantine"
     ESCALATE = "escalate"  # conflict → human-in-the-loop
+    DISCARD = "discard"    # near-identical duplicate → auto-dropped, no review
 
 
 @dataclass
@@ -50,6 +54,7 @@ def run_write_gate(
     existing_embeddings: dict[str, list[float]] | None = None,
     duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
     conflict_threshold: float = DEFAULT_CONFLICT_THRESHOLD,
+    auto_duplicate_threshold: float = DEFAULT_AUTO_DUPLICATE_THRESHOLD,
     review_result: ReviewResult | None = None,
 ) -> GateOutcome:
     """Run all gates in sequence and return a commit/quarantine/escalate decision.
@@ -128,6 +133,13 @@ def run_write_gate(
         )
         if best_id is not None:
             score = cosine_similarity(new_embedding, existing_embeddings[best_id])
+            if score >= auto_duplicate_threshold:
+                return GateOutcome(
+                    decision=GateDecision.DISCARD,
+                    claim=claim,
+                    detail=f"consistency: near-identical to {best_id[:8]} (similarity={score:.3f}) — auto-dropped",
+                    related_id=best_id,
+                )
             if score >= duplicate_threshold:
                 return GateOutcome(
                     decision=GateDecision.QUARANTINE,
@@ -145,22 +157,18 @@ def run_write_gate(
                     ),
                     related_id=best_id,
                 )
-    else:
-        # Fallback heuristic when embeddings are unavailable
-        conflicts = [
-            c for c in existing_trusted
-            if c.source.section == claim.source.section and c.source.id != claim.source.id
-        ]
-        if conflicts:
-            return GateOutcome(
-                decision=GateDecision.ESCALATE,
-                claim=claim,
-                detail=(
-                    f"consistency: contradicts {len(conflicts)} high-trust claim(s) "
-                    "in the same section — human review required"
-                ),
-                related_id=conflicts[0].claim_id,
-            )
+    elif existing_embeddings:
+        # This claim has no embedding but the store does — we cannot run the
+        # semantic check, so DEFER rather than guess. (The old section-based
+        # heuristic treated every same-section claim as a contradiction, which
+        # produced mass false positives for whole-document ingests where every
+        # claim shares section "full".) `secure-wiki reembed` recomputes the
+        # embedding and re-gates these deferred claims properly.
+        return GateOutcome(
+            decision=GateDecision.QUARANTINE,
+            claim=claim,
+            detail="consistency: embedding unavailable — deferred (run `secure-wiki reembed`)",
+        )
     claim.gates_passed.append("consistency")
 
     claim.status = ClaimStatus.ACTIVE

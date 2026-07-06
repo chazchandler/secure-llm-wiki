@@ -44,7 +44,7 @@ secure-llm-wiki/
 ├── environment.yml              # Conda environment (Python 3.10+)
 ├── .env.example                 # LLM and wiki path config template
 ├── src/secure_wiki/
-│   ├── __main__.py              # CLI: ingest · review · list · context · query · init ✅
+│   ├── __main__.py              # CLI: ingest · review · reembed · list · context · query · init ✅
 │   ├── models.py                # Claim / SourceRef / Correction / TrustLevel — provenance schema ✅
 │   ├── llm_client.py            # Ollama + Anthropic provider abstraction, token usage ✅
 │   ├── prompts.py               # All system prompts, nonce-delimiter builders ✅
@@ -159,6 +159,13 @@ secure-wiki ingest path/to/document.txt --review
 # driving the outstanding count to zero.
 secure-wiki review
 
+# Recover after an embedding-service outage. Backfills embeddings for any claims
+# that missed one, then re-runs Gate 5 on the deferred consistency findings:
+# clears the false ones (auto-commit), auto-drops true duplicates, and re-labels
+# anything still similar for review. Run this before `review` if you see
+# "embedding unavailable — deferred" findings.
+secure-wiki reembed
+
 # List committed claims
 secure-wiki list
 
@@ -217,7 +224,11 @@ Every pipeline layer enforces a single invariant: untrusted input never reaches 
 2. **Provenance** — source.id, URI, content hash must all be set
 3. **Trust-tier** — untrusted claim cannot overwrite established high-trust content
 4. **Adversarial review** — independent model checks for manipulation, not correctness
-5. **Consistency** — conflict with existing high-trust claims → escalate to human
+5. **Consistency** — embedding cosine similarity against existing claims, banded by `trust_rules.yaml`:
+   - `≥ auto_duplicate_threshold` (default 0.97) → **auto-drop** (near-identical restatement, no review)
+   - `≥ duplicate_threshold` (0.95) → quarantine as a duplicate for review
+   - `≥ conflict_threshold` (0.85) → escalate to a human
+   - **no embedding available** → *defer* (`consistency: embedding unavailable`), never a false conflict. Run `secure-wiki reembed` to backfill vectors and re-gate deferred claims.
 
 ### 4-eyes principle
 Extraction and review use **different models** by default. With Ollama: `llama3.1:8b` (extraction) and `mistral` (review). With Anthropic: `claude-haiku-4-5` (extraction) and `claude-sonnet-4-6` (review). A jailbreak that compromises the extractor must not simultaneously compromise the reviewer.
