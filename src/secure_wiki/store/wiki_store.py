@@ -159,6 +159,61 @@ class WikiStore:
         self._commit(path, msg)
         return path
 
+    def promote_from_quarantine(self, claim: Claim, gate_detail: str = "") -> Path:
+        """Move a quarantined claim into pages/ as ACTIVE (human override).
+
+        Writes the ACTIVE claim to pages/, removes the quarantine copy, and
+        records both in a single commit.
+        """
+        self._ensure_init()
+        claim.status = ClaimStatus.ACTIVE
+        dest = self.pages / f"{claim.claim_id}.md"
+        dest.write_text(_serialize(claim, gate_detail), encoding="utf-8")
+        src = self.quarantine / f"{claim.claim_id}.md"
+        paths = [dest]
+        if src.exists():
+            src.unlink()
+            paths.append(src)
+        self._commit_many(paths, f"promote {claim.claim_id[:8]} from quarantine")
+        return dest
+
+    def mark_quarantine_reviewed(self, claim: Claim, gate_detail: str = "") -> Path:
+        """Rewrite a quarantined claim in place (e.g. to record its resolution)."""
+        self._ensure_init()
+        claim.status = ClaimStatus.QUARANTINED
+        path = self.quarantine / f"{claim.claim_id}.md"
+        path.write_text(_serialize(claim, gate_detail), encoding="utf-8")
+        self._commit(path, f"review {claim.claim_id[:8]} — {claim.resolution or 'kept'}")
+        return path
+
+    def delete_quarantined_claim(self, claim_id: str) -> bool:
+        """Remove a single quarantined claim file and commit. Returns True if removed."""
+        path = self.quarantine / f"{claim_id}.md"
+        if not path.exists():
+            return False
+        path.unlink()
+        self._commit_many([path], f"drop {claim_id[:8]} from quarantine")
+        return True
+
+    def supersede_claim(self, claim_id: str) -> bool:
+        """Mark an ACTIVE claim in pages/ as SUPERSEDED and commit.
+
+        Returns True if the claim was found and updated. The file is retained
+        (status SUPERSEDED) so it drops out of load_claims(ACTIVE) but the audit
+        trail survives.
+        """
+        path = self.pages / f"{claim_id}.md"
+        if not path.exists():
+            return False
+        try:
+            claim = _deserialize(path)
+        except Exception:
+            return False
+        claim.status = ClaimStatus.SUPERSEDED
+        path.write_text(_serialize(claim), encoding="utf-8")
+        self._commit(path, f"supersede {claim_id[:8]}")
+        return True
+
     def save_source(
         self,
         source_id: str,
@@ -310,6 +365,28 @@ class WikiStore:
     def load_quarantined(self) -> list[Claim]:
         """Load all claims from quarantine/."""
         return self._load_dir(self.quarantine, status=None)
+
+    def load_quarantined_detailed(self) -> list[tuple[Claim, str]]:
+        """Load quarantined claims paired with their stored gate finding detail.
+
+        The detail is the ``> Gate decision:`` line written to the file body by
+        :func:`_serialize`; it carries the finding that must be resolved.
+        """
+        if not self.quarantine.exists():
+            return []
+        out: list[tuple[Claim, str]] = []
+        for path in sorted(self.quarantine.glob("*.md")):
+            try:
+                claim = _deserialize(path)
+            except Exception:
+                continue
+            detail = ""
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("> Gate decision:"):
+                    detail = line[len("> Gate decision:"):].strip()
+                    break
+            out.append((claim, detail))
+        return out
 
     # ------------------------------------------------------------------
     # Deletes

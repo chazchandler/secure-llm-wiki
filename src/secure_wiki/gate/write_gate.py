@@ -39,6 +39,7 @@ class GateOutcome:
     decision: GateDecision
     claim: Claim
     detail: str
+    related_id: str | None = None  # claim_id this outcome was measured against (Gate 5)
 
 
 def run_write_gate(
@@ -132,6 +133,7 @@ def run_write_gate(
                     decision=GateDecision.QUARANTINE,
                     claim=claim,
                     detail=f"consistency: duplicate of {best_id[:8]} (similarity={score:.3f})",
+                    related_id=best_id,
                 )
             if score >= conflict_threshold:
                 return GateOutcome(
@@ -141,6 +143,7 @@ def run_write_gate(
                         f"consistency: semantically similar to {best_id[:8]} "
                         f"(similarity={score:.3f}) — human review required"
                     ),
+                    related_id=best_id,
                 )
     else:
         # Fallback heuristic when embeddings are unavailable
@@ -156,6 +159,7 @@ def run_write_gate(
                     f"consistency: contradicts {len(conflicts)} high-trust claim(s) "
                     "in the same section — human review required"
                 ),
+                related_id=conflicts[0].claim_id,
             )
     claim.gates_passed.append("consistency")
 

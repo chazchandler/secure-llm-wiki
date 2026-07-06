@@ -2,6 +2,7 @@
 
 Commands:
   ingest <source>   Run the full pipeline on a file or HTTP URI
+  review            Resolve outstanding quarantine/escalate findings interactively
   list              Show active wiki claims (--quarantine for quarantine)
   context           Print wiki content as a safe, nonce-delimited context block
   init              Initialize the wiki repo
@@ -281,6 +282,90 @@ def _safe_embed(text: str) -> list[float] | None:
         return None
 
 
+def _apply_finding(
+    store: WikiStore,
+    emb_store: EmbeddingStore,
+    claim,
+    detail: str,
+    dec,
+    *,
+    from_quarantine: bool,
+    new_embeddings: dict,
+    existing: list,
+    existing_embeddings: dict,
+    committed_ids: set,
+) -> str:
+    """Apply one findings-review decision. Returns 'committed' | 'kept' | 'dropped'.
+
+    ``from_quarantine`` selects the storage path: True when the claim already
+    lives in quarantine/ (standalone review) so files are moved/rewritten;
+    False when it is a fresh claim from the current ingest run.
+    """
+    action = dec.action if dec is not None else "keep"  # undecided → keep
+    note = dec.note if dec is not None else None
+    supersede_id = dec.supersede_id if dec is not None else None
+
+    if action == "drop":
+        store.save_correction(
+            make_correction(claim, "drop", None, note, related_claim_id=supersede_id)
+        )
+        if from_quarantine:
+            store.delete_quarantined_claim(claim.claim_id)
+        print(f"[review]   drop      {claim.claim_id[:8]}  {detail}")
+        return "dropped"
+
+    if action == "keep":
+        claim.resolution = None if dec is None else "kept"
+        if from_quarantine:
+            store.mark_quarantine_reviewed(claim, detail)
+        else:
+            store.save_quarantined(claim, detail)
+        return "kept"
+
+    # commit / supersede / edit(&merge) → promote to the wiki (human override)
+    if action == "edit" and dec is not None and dec.new_text and dec.new_text != claim.text:
+        store.save_correction(
+            make_correction(claim, "edit", dec.new_text, note, related_claim_id=supersede_id)
+        )
+        claim.text = dec.new_text
+        new_embeddings.pop(claim.claim_id, None)  # stale — recomputed below
+    elif action == "supersede":
+        store.save_correction(
+            make_correction(claim, "supersede", claim.text, note, related_claim_id=supersede_id)
+        )
+
+    if supersede_id:
+        claim.supersedes = supersede_id
+        if store.supersede_claim(supersede_id):
+            existing[:] = [c for c in existing if c.claim_id != supersede_id]
+            existing_embeddings.pop(supersede_id, None)
+
+    if note:
+        claim.review_notes = f"{claim.review_notes}; {note}" if claim.review_notes else note
+    claim.resolution = "committed"
+
+    # Ensure an embedding exists so future dedup works (fresh ingest usually
+    # already has one; quarantined claims and edits do not).
+    if new_embeddings.get(claim.claim_id) is None:
+        emb = _safe_embed(claim.text)
+        if emb is not None:
+            new_embeddings[claim.claim_id] = emb
+
+    if from_quarantine:
+        store.promote_from_quarantine(claim, gate_detail=f"human override: {detail}")
+    else:
+        claim.status = ClaimStatus.ACTIVE
+        store.save_claim(claim, gate_detail=f"human override: {detail}")
+    existing.append(claim)
+    committed_ids.add(claim.claim_id)
+    emb = new_embeddings.get(claim.claim_id)
+    if emb is not None:
+        emb_store.save(claim.claim_id, emb)
+        existing_embeddings[claim.claim_id] = emb
+    print(f"[review]   commit    {claim.claim_id[:8]}  {_preview(claim.text)}")
+    return "committed"
+
+
 def _resolve_findings(
     pending: list,
     interactive: bool,
@@ -295,8 +380,9 @@ def _resolve_findings(
 
     Default (non-interactive): every finding is written to quarantine as before,
     unaddressed (resolution=None). Under --review with a TTY, the reviewer must
-    resolve each finding — keep / commit / edit / drop — so none are left
-    unaddressed. Returns (committed_delta, quarantined, escalated).
+    resolve each finding — keep / commit / edit / drop, or (against a conflicting
+    claim) take-new / keep-existing / merge — so none are left unaddressed.
+    Returns (committed_delta, quarantined, escalated).
     """
     if not (interactive and is_interactive_capable()):
         if interactive:
@@ -310,11 +396,13 @@ def _resolve_findings(
                 e += 1
         return 0, q, e
 
+    related_by_id = {c.claim_id: c for c in existing}
     findings = [
         (
             o.claim,
             "QUARANTINE" if o.decision == GateDecision.QUARANTINE else "ESCALATE",
             o.detail,
+            related_by_id.get(o.related_id) if o.related_id else None,
         )
         for o in pending
     ]
@@ -324,43 +412,19 @@ def _resolve_findings(
 
     committed = quarantined = escalated = 0
     for outcome, dec in zip(pending, decisions):
-        claim = outcome.claim
-        action = dec.action if dec is not None else "keep"  # undecided → keep
-        note = dec.note if dec is not None else None
-
-        if action == "drop":
-            store.save_correction(make_correction(claim, "drop", None, note))
-            print(f"[review]   drop     {claim.claim_id[:8]}  {outcome.detail}")
-            continue
-
-        if action == "keep":
-            claim.resolution = None if dec is None else "kept"
-            store.save_quarantined(claim, outcome.detail)
+        cat = _apply_finding(
+            store, emb_store, outcome.claim, outcome.detail, dec,
+            from_quarantine=False, new_embeddings=new_embeddings,
+            existing=existing, existing_embeddings=existing_embeddings,
+            committed_ids=committed_ids,
+        )
+        if cat == "committed":
+            committed += 1
+        elif cat == "kept":
             if outcome.decision == GateDecision.QUARANTINE:
                 quarantined += 1
             else:
                 escalated += 1
-            continue
-
-        # commit or edit → promote to the wiki (human override of the gate)
-        if action == "edit" and dec is not None and dec.new_text and dec.new_text != claim.text:
-            store.save_correction(make_correction(claim, "edit", dec.new_text, note))
-            claim.text = dec.new_text
-            new_embeddings[claim.claim_id] = _safe_embed(claim.text) or new_embeddings.get(claim.claim_id)
-        if note:
-            claim.review_notes = f"{claim.review_notes}; {note}" if claim.review_notes else note
-        claim.status = ClaimStatus.ACTIVE
-        claim.resolution = "committed"
-        store.save_claim(claim, gate_detail=f"human override: {outcome.detail}")
-        existing.append(claim)
-        committed_ids.add(claim.claim_id)
-        emb = new_embeddings.get(claim.claim_id)
-        if emb is not None:
-            emb_store.save(claim.claim_id, emb)
-            existing_embeddings[claim.claim_id] = emb
-        committed += 1
-        print(f"[review]   commit   {claim.claim_id[:8]}  {_preview(claim.text)}")
-
     return committed, quarantined, escalated
 
 
@@ -633,6 +697,70 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         print()
 
 
+def _related_from_detail(detail: str, by_prefix: dict) -> object:
+    """Recover the existing claim a stored finding was measured against.
+
+    Gate details embed the conflicting claim's 8-char id (e.g. "duplicate of
+    b23a7f74"); match it back to a loaded active claim so its text can be shown.
+    """
+    m = re.search(r"\b([0-9a-f]{8})\b", detail)
+    return by_prefix.get(m.group(1)) if m else None
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """Resolve outstanding QUARANTINE/ESCALATE findings from any prior run."""
+    store = WikiStore()
+    emb_store = EmbeddingStore(store)
+
+    detailed = store.load_quarantined_detailed()
+    outstanding = [(c, d) for c, d in detailed if c.resolution is None]
+    if not outstanding:
+        print("\n[review] No outstanding findings — quarantine has nothing unaddressed.")
+        return
+
+    print(f"\n[review] {len(outstanding)} outstanding finding(s) to resolve.")
+    if not is_interactive_capable():
+        print("[review] No TTY available — run this command interactively to resolve them.")
+        sys.exit(1)
+
+    active = store.load_claims()
+    by_prefix = {c.claim_id[:8]: c for c in active}
+    findings = []
+    for claim, detail in outstanding:
+        kind = "ESCALATE" if "human review required" in detail else "QUARANTINE"
+        findings.append((claim, kind, detail, _related_from_detail(detail, by_prefix)))
+
+    decisions, completed = review_findings_interactive(findings)
+    if not completed:
+        print("[review] finished with unaddressed finding(s) — they remain quarantined")
+
+    existing = active
+    existing_embeddings = emb_store.load_all()
+    committed = kept = dropped = 0
+    for (claim, detail), dec in zip(outstanding, decisions):
+        cat = _apply_finding(
+            store, emb_store, claim, detail, dec,
+            from_quarantine=True, new_embeddings={},
+            existing=existing, existing_embeddings=existing_embeddings,
+            committed_ids=set(),
+        )
+        if cat == "committed":
+            committed += 1
+        elif cat == "kept":
+            kept += 1
+        else:
+            dropped += 1
+
+    print()
+    print(_LINE)
+    print(f"  committed: {committed}")
+    print(f"  kept:      {kept}")
+    print(f"  dropped:   {dropped}")
+    remaining = len([c for c, _ in store.load_quarantined_detailed() if c.resolution is None])
+    print(f"  unaddressed remaining: {remaining}")
+    print()
+
+
 def cmd_query(args: argparse.Namespace) -> None:
     min_trust = _prompt_min_trust(TrustLevel(args.min_trust))
     ctx = load_for_context(min_trust=min_trust, include_pending=args.include_pending)
@@ -866,6 +994,12 @@ def main() -> None:
              "embedding; corrections are saved to reconcile source docs later",
     )
 
+    # review
+    sub.add_parser(
+        "review",
+        help="Resolve outstanding quarantine/escalate findings from any prior run",
+    )
+
     # query
     query_p = sub.add_parser("query", help="Open an interactive wiki Q&A session")
     query_p.add_argument(
@@ -934,6 +1068,8 @@ def main() -> None:
         cmd_init(args)
     elif args.command == "ingest":
         cmd_ingest(args)
+    elif args.command == "review":
+        cmd_review(args)
     elif args.command == "query":
         cmd_query(args)
     elif args.command == "context":

@@ -104,6 +104,7 @@ def test_resolve_findings_interactive_commit_and_keep(tmp_path, monkeypatch):
     ]
 
     monkeypatch.setattr("secure_wiki.__main__.is_interactive_capable", lambda: True)
+    monkeypatch.setattr("secure_wiki.__main__._safe_embed", lambda _t: None)
     monkeypatch.setattr(
         "secure_wiki.__main__.review_findings_interactive",
         lambda findings, **kw: ([Decision("commit"), Decision("keep")], True),
@@ -160,3 +161,42 @@ def test_resolve_findings_interactive_edit_and_drop(tmp_path, monkeypatch):
     # Both the edit and the drop are preserved as corrections for source reconciliation.
     corrections = store.load_corrections()
     assert sorted(cr.action for cr in corrections) == ["drop", "edit"]
+
+
+def test_resolve_findings_supersede_replaces_existing(tmp_path, monkeypatch):
+    """'take new' commits the new claim and marks the conflicting one superseded."""
+    store, emb = _store(tmp_path)
+    existing = _make_claim("old milestone status")
+    store.save_claim(existing)
+    new = _make_claim("updated milestone status")
+    pending = [GateOutcome(
+        GateDecision.ESCALATE, new,
+        f"consistency: similar to {existing.claim_id[:8]}",
+        related_id=existing.claim_id,
+    )]
+
+    monkeypatch.setattr("secure_wiki.__main__.is_interactive_capable", lambda: True)
+    monkeypatch.setattr("secure_wiki.__main__._safe_embed", lambda _t: None)
+    monkeypatch.setattr(
+        "secure_wiki.__main__.review_findings_interactive",
+        lambda findings, **kw: ([Decision("supersede", supersede_id=existing.claim_id)], True),
+    )
+
+    c, q, e = _resolve_findings(
+        pending, interactive=True, store=store, emb_store=emb,
+        new_embeddings={}, existing=[existing], existing_embeddings={},
+        committed_ids=set(),
+    )
+    assert (c, q, e) == (1, 0, 0)
+
+    active = store.load_claims()  # ACTIVE only
+    assert [a.text for a in active] == ["updated milestone status"]
+    assert active[0].supersedes == existing.claim_id
+
+    all_pages = store.load_claims(status=None)
+    superseded = [c for c in all_pages if c.claim_id == existing.claim_id]
+    assert superseded and superseded[0].status == ClaimStatus.SUPERSEDED
+
+    corr = store.load_corrections()
+    assert corr and corr[0].action == "supersede"
+    assert corr[0].related_claim_id == existing.claim_id

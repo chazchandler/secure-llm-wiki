@@ -43,10 +43,16 @@ ACCEPT_ALL = _Nav("accept_all")  # apply the bulk default to all remaining items
 @dataclass
 class Decision:
     """A per-item review decision. ``action`` meaning depends on the reviewer:
-    claims use accept/edit/drop; findings use keep/commit/edit/drop."""
+    claims use accept/edit/drop; findings use keep/commit/edit/drop/supersede.
+
+    ``supersede_id`` is set when the reviewer resolves a consistency finding by
+    choosing the new claim over (or merging it with) an existing one — the
+    existing claim is then marked superseded.
+    """
     action: str
     new_text: Optional[str] = None
     note: Optional[str] = None
+    supersede_id: Optional[str] = None
 
 
 def run_review_session(
@@ -105,7 +111,13 @@ def run_review_session(
             i += 1
 
 
-def make_correction(claim: Claim, action: str, corrected_text: str | None, note: str | None) -> Correction:
+def make_correction(
+    claim: Claim,
+    action: str,
+    corrected_text: str | None,
+    note: str | None,
+    related_claim_id: str | None = None,
+) -> Correction:
     """Snapshot a correction. Call BEFORE mutating ``claim.text``."""
     return Correction(
         source_id=claim.source.id,
@@ -117,6 +129,7 @@ def make_correction(claim: Claim, action: str, corrected_text: str | None, note:
         original_text=claim.text,
         corrected_text=corrected_text,
         note=note,
+        related_claim_id=related_claim_id,
     )
 
 
@@ -207,26 +220,36 @@ def review_claims_interactive(
 # Post-gate findings review
 # ------------------------------------------------------------------
 
+# Menu shown when a finding is NOT tied to a specific existing claim.
 _FINDING_MENU = (
     "  [k] keep quarantined  [c] commit anyway  [e] edit & commit  [d] drop  "
     "[p] previous  [q] finish"
 )
+# Menu shown when the finding conflicts with a specific existing claim, so the
+# reviewer can choose between the two, merge them, or keep both.
+_FINDING_MENU_PAIR = (
+    "  [n] take new (supersede existing)  [x] keep existing (drop new)  "
+    "[m] merge & edit  [c] commit both\n"
+    "  [k] keep quarantined  [p] previous  [q] finish"
+)
 
 
 def review_findings_interactive(
-    findings: list[tuple[Claim, str, str]],
+    findings: list[tuple[Claim, str, str, Optional[Claim]]],
     *,
     input_fn: Callable[[str], str] = input,
     out: Callable[[str], None] = print,
 ) -> tuple[list[Optional[Decision]], bool]:
     """Resolve every non-commit gate finding.
 
-    ``findings`` is a list of ``(claim, kind, detail)`` where *kind* is
-    ``"QUARANTINE"`` or ``"ESCALATE"`` and *detail* is the gate's explanation.
+    ``findings`` is a list of ``(claim, kind, detail, related)`` where *kind* is
+    ``"QUARANTINE"`` or ``"ESCALATE"``, *detail* is the gate's explanation, and
+    *related* is the existing claim this one was measured against (or None). When
+    *related* is present its text is shown side by side so the reviewer can pick
+    either claim, merge them, or keep both.
 
-    Returns ``(decisions, completed)`` aligned to *findings*. Each decision's
-    ``action`` is one of keep / commit / edit / drop. ``completed`` is False
-    only if the reviewer force-quit with findings still unaddressed.
+    Returns ``(decisions, completed)`` aligned to *findings*. ``completed`` is
+    False only if the reviewer force-quit with findings still unaddressed.
     """
     total = len(findings)
     out("")
@@ -245,35 +268,67 @@ def review_findings_interactive(
         return ans == "y"
 
     def _decide(i: int, prior: Optional[Decision]) -> object:
-        claim, kind, detail = findings[i]
+        claim, kind, detail, related = findings[i]
         out("")
         out(f"  finding {i + 1}/{total}  {kind}  [{claim.trust_level.value}]")
         out(f"    {detail}")
-        out(f"    claim: {claim.text}")
+        if related is not None:
+            out(f"    existing {related.claim_id[:8]}: {related.text}")
+            out(f"    new:      {claim.text}")
+        else:
+            out(f"    claim: {claim.text}")
         if prior is not None:
             _show_prior(out, prior)
+
+        menu = _FINDING_MENU_PAIR if related is not None else _FINDING_MENU
         try:
-            choice = input_fn(f"{_FINDING_MENU}\n  > ").strip()
+            choice = input_fn(f"{menu}\n  > ").strip()
         except (EOFError, KeyboardInterrupt):
             return QUIT
 
-        if choice in ("", "k"):
-            return Decision("keep")
-        if choice == "c":
-            note = input_fn("  note (optional): ").strip() or None
-            return Decision("commit", note=note)
         if choice == "p":
             return PREV
         if choice == "q":
             return QUIT
-        if choice == "e":
-            new_text = input_fn("  new text (blank = keep original): ").strip()
-            note = input_fn("  note (optional): ").strip() or None
-            return Decision("edit", new_text=new_text or None, note=note)
-        if choice == "d":
-            note = input_fn("  reason (optional): ").strip() or None
-            return Decision("drop", note=note)
-        out("  ? unrecognized — choose k / c / e / d / p / q")
+        if choice in ("", "k"):
+            return Decision("keep")
+
+        if related is not None:
+            if choice == "n":  # take new, supersede the existing claim
+                note = input_fn("  note (optional): ").strip() or None
+                return Decision("supersede", note=note, supersede_id=related.claim_id)
+            if choice == "x":  # keep existing, drop the new claim
+                note = input_fn("  note (optional): ").strip() or None
+                return Decision(
+                    "drop",
+                    note=note or f"kept existing {related.claim_id[:8]}",
+                )
+            if choice == "m":  # merge the two into one claim, supersede existing
+                new_text = input_fn("  merged text: ").strip()
+                if not new_text:
+                    out("  empty — nothing merged")
+                    return _decide(i, prior)
+                note = input_fn("  note (optional): ").strip() or None
+                return Decision(
+                    "edit", new_text=new_text, note=note, supersede_id=related.claim_id
+                )
+            if choice == "c":  # keep both — commit new alongside existing
+                note = input_fn("  note (optional): ").strip() or None
+                return Decision("commit", note=note)
+        else:
+            if choice == "c":
+                note = input_fn("  note (optional): ").strip() or None
+                return Decision("commit", note=note)
+            if choice == "e":
+                new_text = input_fn("  new text (blank = keep original): ").strip()
+                note = input_fn("  note (optional): ").strip() or None
+                return Decision("edit", new_text=new_text or None, note=note)
+            if choice == "d":
+                note = input_fn("  reason (optional): ").strip() or None
+                return Decision("drop", note=note)
+
+        valid = "n / x / m / c / k / p / q" if related is not None else "k / c / e / d / p / q"
+        out(f"  ? unrecognized — choose {valid}")
         return _decide(i, prior)  # re-prompt same item
 
     return run_review_session(
@@ -287,6 +342,8 @@ def _show_prior(out: Callable[[str], None], prior: Decision) -> None:
     label = prior.action
     if prior.action == "edit" and prior.new_text:
         label = f"edit → {prior.new_text}"
+    elif prior.action == "supersede" and prior.supersede_id:
+        label = f"supersede {prior.supersede_id[:8]}"
     out(f"    (current decision: {label})")
 
 

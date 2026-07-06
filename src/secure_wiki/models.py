@@ -121,10 +121,13 @@ class Correction:
     section: str
     content_hash: str          # hash of the source doc the claim came from
     claim_id: str
-    action: str                # "edit" | "drop"
+    action: str                # "edit" | "drop" | "supersede"
     original_text: str         # the claim text as the model extracted it
     corrected_text: Optional[str] = None  # None for a dropped claim
     note: Optional[str] = None            # reviewer's rationale
+    # For findings resolved against an existing claim: the claim that was chosen
+    # over, superseded by, or merged with this one (Gate 5 consistency review).
+    related_claim_id: Optional[str] = None
     corrected_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -144,6 +147,7 @@ class Correction:
             original_text=d["original_text"],
             corrected_text=d.get("corrected_text"),
             note=d.get("note"),
+            related_claim_id=d.get("related_claim_id"),
             corrected_at=d.get("corrected_at", ""),
         )
 

@@ -1,6 +1,9 @@
 """Tests for interactive claim review and correction persistence."""
 from __future__ import annotations
 
+import argparse
+
+from secure_wiki import __main__ as m
 from secure_wiki.models import Claim, SourceRef, TrustLevel
 from secure_wiki.review.interactive import (
     Decision,
@@ -155,8 +158,8 @@ def test_engine_requires_all_and_jumps_back_to_unresolved():
 # Findings review (non-commit resolutions)
 # ------------------------------------------------------------------
 
-def _finding(text: str, kind: str = "ESCALATE"):
-    return (_claim(text), kind, f"consistency: similar to abcd1234 — {kind}")
+def _finding(text: str, kind: str = "ESCALATE", related=None):
+    return (_claim(text), kind, f"consistency: similar to abcd1234 — {kind}", related)
 
 
 def test_findings_keep_commit_edit_drop():
@@ -196,3 +199,86 @@ def test_findings_declining_quit_forces_resolution():
     )
     assert completed
     assert [d.action for d in decisions] == ["keep", "keep"]
+
+
+# ------------------------------------------------------------------
+# Pairwise findings (finding measured against an existing claim)
+# ------------------------------------------------------------------
+
+def test_findings_take_new_supersedes_existing():
+    existing = _claim("old fact")
+    findings = [_finding("new fact", "ESCALATE", related=existing)]
+    decisions, completed = review_findings_interactive(
+        findings, input_fn=_scripted(["n", ""]), out=lambda _m: None
+    )
+    assert completed
+    assert decisions[0].action == "supersede"
+    assert decisions[0].supersede_id == existing.claim_id
+
+
+def test_findings_keep_existing_drops_new():
+    existing = _claim("old fact")
+    findings = [_finding("new fact", "QUARANTINE", related=existing)]
+    decisions, _ = review_findings_interactive(
+        findings, input_fn=_scripted(["x", ""]), out=lambda _m: None
+    )
+    assert decisions[0].action == "drop"
+    # Even a bare drop records which existing claim was chosen instead.
+    assert existing.claim_id[:8] in (decisions[0].note or "")
+
+
+def test_findings_merge_edits_and_supersedes():
+    existing = _claim("old fact")
+    findings = [_finding("new fact", "ESCALATE", related=existing)]
+    decisions, _ = review_findings_interactive(
+        findings, input_fn=_scripted(["m", "merged fact", "combined"]), out=lambda _m: None
+    )
+    assert decisions[0].action == "edit"
+    assert decisions[0].new_text == "merged fact"
+    assert decisions[0].supersede_id == existing.claim_id
+
+
+def test_findings_keep_both_commits_without_supersede():
+    existing = _claim("old fact")
+    findings = [_finding("new fact", "ESCALATE", related=existing)]
+    decisions, _ = review_findings_interactive(
+        findings, input_fn=_scripted(["c", ""]), out=lambda _m: None
+    )
+    assert decisions[0].action == "commit"
+    assert decisions[0].supersede_id is None
+
+
+# ------------------------------------------------------------------
+# Standalone `review` command
+# ------------------------------------------------------------------
+
+def test_cmd_review_resolves_outstanding_findings(tmp_path, monkeypatch):
+    root = tmp_path / "wiki"
+    monkeypatch.setenv("WIKI_DATA_PATH", str(root))
+    store = WikiStore(root=root)
+    store.init()
+    # A prior non-interactive run left an unaddressed finding in quarantine.
+    claim = _claim("candidate fact from a past run")
+    store.save_quarantined(claim, "consistency: duplicate of 12345678 (similarity=0.99)")
+    assert claim.resolution is None
+
+    monkeypatch.setattr(m, "is_interactive_capable", lambda: True)
+    monkeypatch.setattr(m, "_safe_embed", lambda _t: None)
+    monkeypatch.setattr(
+        m, "review_findings_interactive",
+        lambda findings, **kw: ([Decision("commit")], True),
+    )
+
+    m.cmd_review(argparse.Namespace())
+
+    fresh = WikiStore(root=root)
+    assert [c.text for c in fresh.load_claims()] == ["candidate fact from a past run"]
+    assert fresh.load_quarantined() == []
+
+
+def test_cmd_review_noop_when_nothing_outstanding(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "wiki"
+    monkeypatch.setenv("WIKI_DATA_PATH", str(root))
+    WikiStore(root=root).init()
+    m.cmd_review(argparse.Namespace())
+    assert "No outstanding findings" in capsys.readouterr().out

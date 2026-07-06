@@ -44,7 +44,7 @@ secure-llm-wiki/
 ├── environment.yml              # Conda environment (Python 3.10+)
 ├── .env.example                 # LLM and wiki path config template
 ├── src/secure_wiki/
-│   ├── __main__.py              # CLI: ingest · list · context · query · init ✅
+│   ├── __main__.py              # CLI: ingest · review · list · context · query · init ✅
 │   ├── models.py                # Claim / SourceRef / Correction / TrustLevel — provenance schema ✅
 │   ├── llm_client.py            # Ollama + Anthropic provider abstraction, token usage ✅
 │   ├── prompts.py               # All system prompts, nonce-delimiter builders ✅
@@ -125,8 +125,15 @@ secure-wiki ingest report.txt --trust semi-trusted --source-id vendor-advisory-2
 # Off by default so ingestion stays non-interactive; requires a TTY.
 # Claims:   [a]ccept · [e]dit · [d]rop · [p]revious · [A]ccept all · [q]finish
 # Findings: [k]eep · [c]ommit anyway · [e]dit & commit · [d]rop · [p]revious · [q]finish
-# Edits/drops are saved to wiki_data/corrections/ so the original source can be reconciled later.
+# Conflict findings also show the existing claim side by side, adding:
+#   [n]take new (supersede existing) · [x]keep existing (drop new) · [m]merge & edit
+# Edits/drops/merges are saved to wiki_data/corrections/ so the original source can be reconciled later.
 secure-wiki ingest path/to/document.txt --review
+
+# Resolve outstanding findings from any PAST run (e.g. a non-interactive ingest).
+# Walks every unaddressed quarantine/escalate finding with the same review UI,
+# driving the outstanding count to zero.
+secure-wiki review
 
 # List committed claims
 secure-wiki list
@@ -197,7 +204,11 @@ Extraction and review use **different models** by default. With Ollama: `llama3.
 1. **Pre-embed claim review** — between extraction and embedding, each extracted claim can be accepted, edited, or dropped. Corrected text is what flows downstream through the write-gate and into the wiki.
 2. **Post-gate findings review** — after the write-gate runs, every non-commit outcome (QUARANTINE / ESCALATE) must be resolved so **none are left unaddressed**: `keep` (accept the gate; stays quarantined, marked reviewed), `commit` (override the gate and promote to the wiki), `edit & commit` (fix the text, then promote), or `drop` (discard entirely). Committed claims record `resolution: committed`; kept ones record `resolution: kept`; an unreviewed finding has no resolution.
 
-Both reviews are navigable — you can step **back** to a previous item to fix a mistake, not only forward. Every edit or drop is persisted as a `Correction` record under `wiki_data/corrections/` (git-committed like claims), pinning the source id, content hash, claim id, original model text, and the human's action. These records are the durable link back to the originating document, so the **original source can later be reconciled** with the reviewed knowledge — the corrections survive independently of the claim itself.
+   When a finding is a **consistency conflict against a specific existing claim** (Gate 5), that claim's text is shown side by side with the new one so the reviewer can decide between them directly: `take new` (commit the new claim and mark the existing one `superseded`), `keep existing` (drop the new claim), `merge & edit` (write a combined claim that supersedes the existing one), or `keep both`. The chosen claim's id is captured on the `Correction` (`related_claim_id`) so the decision is auditable.
+
+Both reviews are navigable — you can step **back** to a previous item to fix a mistake, not only forward. Every edit, drop, merge, or supersede is persisted as a `Correction` record under `wiki_data/corrections/` (git-committed like claims), pinning the source id, content hash, claim id, original model text, and the human's action. These records are the durable link back to the originating document, so the **original source can later be reconciled** with the reviewed knowledge — the corrections survive independently of the claim itself.
+
+Findings from a **non-interactive** ingest stay quarantined with no resolution until addressed. `secure-wiki review` walks every such outstanding finding — using the same side-by-side comparison UI — and drives the unaddressed count to zero, independent of any ingest run.
 
 ### Fail-closed
 Unparseable LLM responses are treated as failures — empty extraction returns no claims, unparseable review verdict blocks the write. The system never silently passes bad output.
