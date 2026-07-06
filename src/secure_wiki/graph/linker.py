@@ -1,4 +1,9 @@
-"""Add bidirectional [[wikilinks]] to wiki pages."""
+"""Add bidirectional cross-links to wiki pages.
+
+Links use the OKF standard-markdown, bundle-relative form
+``[Title](/subdir/slug.md)`` (see docs/okf-spec.md §5), where the bundle
+root is the ``wiki/`` directory.
+"""
 from __future__ import annotations
 
 import re
@@ -41,29 +46,33 @@ def _split_zones(text: str) -> tuple[str, list[tuple[str, bool]]]:
     return frontmatter, segments
 
 
-def _slug_to_link(slug: str, subdir: str) -> str:
-    return f"[[{subdir}/{slug}]]"
+def _slug_to_link(slug: str, subdir: str, title: str | None = None) -> str:
+    return f"[{title or slug}](/{subdir}/{slug}.md)"
 
 
 def _already_linked(text: str, subdir: str, slug: str) -> bool:
-    return f"[[{subdir}/{slug}" in text
+    return f"](/{subdir}/{slug}.md)" in text
 
 
 def _link_text_zone(zone: str, slug: str, title: str, subdir: str) -> str:
-    """Insert [[subdir/slug|Title]] around unlinked bare mentions of title in zone."""
+    """Insert [Title](/subdir/slug.md) around unlinked bare mentions of title."""
     if _already_linked(zone, subdir, slug):
         return zone
     pattern = re.compile(rf"\b{re.escape(title)}\b", re.IGNORECASE)
-    replacement = f"[[{subdir}/{slug}|{title}]]"
+    target = f"/{subdir}/{slug}.md"
 
     def replace_if_not_linked(m: re.Match) -> str:
-        start = m.start()
-        # Check if already inside a [[...]] span by scanning backwards
+        start, end = m.start(), m.end()
         before = zone[:start]
-        open_count = before.count("[[") - before.count("]]")
-        if open_count > 0:
+        # Inside an existing markdown link's URL — "](…<here>…)".
+        if before.rfind("](") > before.rfind(")"):
             return m.group()
-        return replacement
+        # Already the link text of a markdown link — "[Title](…".
+        if start > 0 and zone[start - 1] == "[":
+            return m.group()
+        if zone[end : end + 2] == "](":
+            return m.group()
+        return f"[{m.group()}]({target})"
 
     return pattern.sub(replace_if_not_linked, zone)
 

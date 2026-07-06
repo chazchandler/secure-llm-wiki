@@ -898,7 +898,7 @@ def cmd_lint(args: argparse.Namespace) -> None:
     print()
     print(_LINE)
     print(f"  orphans:          {len(orphans)} page(s) with no inbound links")
-    print(f"  missing links:    {len(missing)} [[wikilink]] target(s) not found")
+    print(f"  missing links:    {len(missing)} link target(s) not found")
     print(f"  contradictions:   {len(report.contradictions)} pair(s) flagged")
     print(f"  incomplete pages: {len(incomplete)}")
     print(f"  low-confidence:   {len(low_conf)} claim(s)")

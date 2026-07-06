@@ -36,7 +36,7 @@ def test_orphan_detected_no_inbound_links(tmp_path):
 def test_orphan_not_detected_when_linked(tmp_path):
     store = WikiStore(root=tmp_path)
     store.init()
-    _make_page(store, "concept", "elt", body="## Content\nSee [[entities/aws|AWS]].")
+    _make_page(store, "concept", "elt", body="## Content\nSee [AWS](/entities/aws.md).")
     _make_page(store, "entity", "aws")
     orphans = check_orphans(store)
     assert "aws" not in orphans
@@ -45,7 +45,7 @@ def test_orphan_not_detected_when_linked(tmp_path):
 def test_missing_link_detected(tmp_path):
     store = WikiStore(root=tmp_path)
     store.init()
-    _make_page(store, "concept", "elt", body="## Content\nSee [[entities/nonexistent]].")
+    _make_page(store, "concept", "elt", body="## Content\nSee [Nonexistent](/entities/nonexistent.md).")
     missing = check_missing_links(store)
     assert "entities/nonexistent" in missing
 
@@ -54,7 +54,7 @@ def test_missing_link_not_reported_when_exists(tmp_path):
     store = WikiStore(root=tmp_path)
     store.init()
     _make_page(store, "entity", "aws")
-    _make_page(store, "concept", "elt", body="## Content\nSee [[entities/aws]].")
+    _make_page(store, "concept", "elt", body="## Content\nSee [AWS](/entities/aws.md).")
     missing = check_missing_links(store)
     assert "entities/aws" not in missing
 

@@ -80,6 +80,23 @@ secure-llm-wiki/
     └── trust_rules.yaml         # User-editable trust rules
 ```
 
+## Wiki content format (OKF)
+
+The enriched wiki bundle under `wiki_data/wiki/` conforms to the **Open
+Knowledge Format** — see [`docs/okf-spec.md`](docs/okf-spec.md) for the full
+v0.1 specification. In short:
+
+- **Concept documents** (`concepts/`, `entities/`, `summaries/`) are markdown
+  files whose YAML frontmatter leads with the OKF-recommended keys — `type`
+  (required), `title`, `description`, `tags`, `timestamp` — followed by
+  producer extensions (`confidence`, `sources`, `slug`, `created`, `updated`).
+- **Cross-links** use standard bundle-relative markdown links,
+  `[Title](/entities/temporal.md)`, where the bundle root is `wiki_data/wiki/`.
+- **`index.md`** is a progressive-disclosure listing (`* [Title](/path.md) -
+  description`) and is the only file carrying an `okf_version` declaration.
+- **`log.md`** groups ingest history under `## YYYY-MM-DD` headings, newest
+  first, as `* **<kind>**: <entry>` lines.
+
 ## Setup
 
 ```bash

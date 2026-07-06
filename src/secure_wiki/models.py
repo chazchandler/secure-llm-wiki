@@ -154,9 +154,16 @@ class Correction:
 
 @dataclass
 class WikiPage:
-    """A structured wiki page (summary, concept, or entity) with YAML frontmatter."""
+    """A structured wiki page (summary, concept, or entity) as an OKF concept
+    document (see docs/okf-spec.md).
+
+    The on-disk frontmatter leads with the OKF-recommended keys — ``type``
+    (required), ``title``, ``description``, ``tags``, ``timestamp`` — and keeps
+    the producer-specific fields (``confidence``, ``sources``, ``slug``,
+    ``created``, ``updated``) as permitted extensions.
+    """
     slug: str
-    page_type: str          # "summary" | "concept" | "entity"
+    page_type: str          # OKF `type` value: "summary" | "concept" | "entity"
     title: str
     tags: list[str]
     confidence: str         # "high" | "medium" | "low"
@@ -164,17 +171,22 @@ class WikiPage:
     body: str
     created: str            # ISO date
     updated: str            # ISO date
+    description: str = ""    # OKF one-line summary
 
     def to_markdown(self) -> str:
         fm = yaml.dump(
             {
-                "confidence": self.confidence,
-                "created": self.created,
-                "slug": self.slug,
-                "sources": self.sources,
-                "tags": self.tags,
-                "title": self.title,
+                # OKF-recommended fields (type is REQUIRED)
                 "type": self.page_type,
+                "title": self.title,
+                "description": self.description,
+                "tags": self.tags,
+                "timestamp": self.updated,
+                # producer extensions
+                "confidence": self.confidence,
+                "sources": self.sources,
+                "slug": self.slug,
+                "created": self.created,
                 "updated": self.updated,
             },
             default_flow_style=False,
@@ -191,6 +203,8 @@ class WikiPage:
             raise ValueError(f"missing frontmatter in {path}")
         raw = yaml.safe_load(parts[1])
         body = parts[2].strip()
+        # `timestamp` is the OKF last-modified field; fall back to `updated`.
+        timestamp = raw.get("timestamp") or raw.get("updated", "")
         return cls(
             slug=raw.get("slug", path.stem),
             page_type=raw.get("type", "concept"),
@@ -200,7 +214,8 @@ class WikiPage:
             sources=raw.get("sources", []),
             body=body,
             created=raw.get("created", ""),
-            updated=raw.get("updated", ""),
+            updated=raw.get("updated", "") or timestamp,
+            description=raw.get("description", ""),
         )
 
 

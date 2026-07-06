@@ -10,7 +10,7 @@ def test_fix_creates_stub_for_missing_link(tmp_path):
     (store.wiki / "concepts" / "elt.md").write_text(
         "---\ntitle: ELT\ntype: concept\nconfidence: high\ntags: []\nsources: []\n"
         "slug: elt\ncreated: '2026-06-18'\nupdated: '2026-06-18'\n---\n\n"
-        "See [[entities/ghost]]."
+        "See [Ghost](/entities/ghost.md)."
     )
     report = LintReport(missing_links=["entities/ghost"])
     fixes = apply_fixes(store, report)
@@ -24,7 +24,7 @@ def test_fix_is_idempotent(tmp_path):
     (store.wiki / "concepts" / "elt.md").write_text(
         "---\ntitle: ELT\ntype: concept\nconfidence: high\ntags: []\nsources: []\n"
         "slug: elt\ncreated: '2026-06-18'\nupdated: '2026-06-18'\n---\n\n"
-        "See [[entities/ghost]]."
+        "See [Ghost](/entities/ghost.md)."
     )
     report = LintReport(missing_links=["entities/ghost"])
     apply_fixes(store, report)

@@ -7,7 +7,8 @@ from pathlib import Path
 from ..models import WikiPage
 from ..store.wiki_store import WikiStore
 
-_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
+# OKF cross-links are standard markdown: [Title](/subdir/slug.md).
+_MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 
 
 def _all_wiki_pages(store: WikiStore) -> list[Path]:
@@ -20,29 +21,43 @@ def _all_wiki_pages(store: WikiStore) -> list[Path]:
 
 
 def _extract_links(text: str) -> list[str]:
-    """Extract all [[target]] targets from text, skipping frontmatter."""
+    """Extract intra-bundle link targets as ``subdir/slug``, skipping frontmatter.
+
+    Only bundle-relative markdown links to ``.md`` files are returned; external
+    URLs and anchors are ignored (OKF §5).
+    """
     if text.startswith("---\n"):
         end = text.find("\n---\n", 4)
         if end != -1:
             text = text[end + 5:]
-    return _WIKILINK_RE.findall(text)
+
+    targets: list[str] = []
+    for raw in _MD_LINK_RE.findall(text):
+        target = raw.strip()
+        if "://" in target or target.startswith(("#", "mailto:")):
+            continue
+        if not target.endswith(".md"):
+            continue
+        parts = [p for p in target.split("/") if p not in ("", ".", "..")]
+        if not parts:
+            continue
+        parts[-1] = parts[-1][:-3]  # strip .md
+        targets.append("/".join(parts))
+    return targets
 
 
 def check_orphans(store: WikiStore) -> list[str]:
-    """Return slugs of pages that have no inbound [[wikilinks]] from any other page."""
+    """Return slugs of pages that have no inbound links from any other page."""
     pages = _all_wiki_pages(store)
     if not pages:
         return []
 
-    # Collect all link targets
+    # Collect all link targets (normalized to "subdir/slug")
     all_targets: set[str] = set()
     for page_path in pages:
         try:
             text = page_path.read_text(encoding="utf-8")
-            for target in _extract_links(text):
-                # Normalize: strip trailing .md if present
-                all_targets.add(target.rstrip(".md").rstrip("/"))
-                all_targets.add(target)
+            all_targets.update(_extract_links(text))
         except Exception:
             pass
 
@@ -59,7 +74,7 @@ def check_orphans(store: WikiStore) -> list[str]:
 
 
 def check_missing_links(store: WikiStore) -> list[str]:
-    """Return [[target]] strings where the target page does not exist."""
+    """Return link targets ("subdir/slug") whose target page does not exist."""
     pages = _all_wiki_pages(store)
     missing = []
     seen: set[str] = set()

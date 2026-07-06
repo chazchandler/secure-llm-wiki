@@ -126,7 +126,12 @@ class WikiStore:
 
         index = self.wiki / "index.md"
         if not index.exists():
-            index.write_text("# Wiki Index\n\n(no pages yet)\n", encoding="utf-8")
+            # The bundle-root index.md is the only place OKF permits
+            # frontmatter, used to declare the targeted spec version (§11).
+            index.write_text(
+                '---\nokf_version: "0.1"\n---\n\n# Wiki Index\n\n(no pages yet)\n',
+                encoding="utf-8",
+            )
 
         log = self.wiki / "log.md"
         if not log.exists():
@@ -327,31 +332,78 @@ class WikiStore:
         _git(["commit", "-m", message], self.root)
 
     def update_index(self) -> Path:
-        """Regenerate wiki/index.md from all concept/entity/summary pages."""
+        """Regenerate wiki/index.md as an OKF index file (see docs/okf-spec.md §6).
+
+        The root index carries the ``okf_version`` frontmatter (§11) — the only
+        place OKF permits frontmatter in an index. Each section lists its
+        concepts as bundle-relative markdown links with their descriptions.
+        """
         self._ensure_init()
-        lines = ["# Wiki Index\n"]
+        lines = ['---', 'okf_version: "0.1"', '---', '', '# Wiki Index', '']
+        section_titles = {
+            "summaries": "Summaries",
+            "concepts": "Concepts",
+            "entities": "Entities",
+        }
         for subdir_name in ("summaries", "concepts", "entities"):
             subdir = self.wiki / subdir_name
             pages = sorted(subdir.glob("*.md")) if subdir.exists() else []
-            if pages:
-                lines.append(f"\n## {subdir_name.capitalize()}\n")
-                for p in pages:
-                    slug = p.stem
-                    lines.append(f"- [[{subdir_name}/{slug}]]")
+            if not pages:
+                continue
+            lines.append(f"## {section_titles[subdir_name]}")
+            lines.append("")
+            for p in pages:
+                slug = p.stem
+                try:
+                    page = WikiPage.from_file(p)
+                    title = page.title or slug
+                    desc = page.description
+                except Exception:
+                    title, desc = slug, ""
+                entry = f"* [{title}](/{subdir_name}/{slug}.md)"
+                if desc:
+                    entry += f" - {desc}"
+                lines.append(entry)
+            lines.append("")
         index = self.wiki / "index.md"
-        index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        index.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         return index
 
-    def append_log(self, entry: str) -> Path:
-        """Append a timestamped entry to wiki/log.md."""
+    def append_log(self, entry: str, kind: str = "Update") -> Path:
+        """Record an entry in wiki/log.md as an OKF log file (see §7).
+
+        Entries are grouped under ``## YYYY-MM-DD`` date headings, newest first,
+        each written as ``* **<kind>**: <entry>``.
+        """
         from datetime import datetime, timezone
         self._ensure_init()
         log = self.wiki / "log.md"
-        if not log.exists():
-            log.write_text("# Ingest Log\n\n", encoding="utf-8")
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with log.open("a", encoding="utf-8") as f:
-            f.write(f"{ts}  {entry}\n")
+        text = log.read_text(encoding="utf-8") if log.exists() else ""
+
+        lines = text.splitlines()
+        header = "# Ingest Log"
+        if lines and lines[0].startswith("# "):
+            header = lines[0]
+            body_lines = lines[1:]
+        else:
+            body_lines = lines
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        body = "\n".join(body_lines).strip()
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_heading = f"## {today}"
+        entry_line = f"* **{kind}**: {entry}"
+
+        if body.startswith(date_heading):
+            # Insert under the existing (newest) date section, newest first.
+            rest = body[len(date_heading):].lstrip("\n")
+            body = f"{date_heading}\n{entry_line}\n{rest}".rstrip()
+        else:
+            prefix = f"{date_heading}\n{entry_line}"
+            body = f"{prefix}\n\n{body}".rstrip() if body else prefix
+
+        log.write_text(f"{header}\n\n{body}\n", encoding="utf-8")
         return log
 
     # ------------------------------------------------------------------

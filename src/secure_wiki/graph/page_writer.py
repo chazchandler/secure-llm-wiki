@@ -15,6 +15,14 @@ def _normalize_slug(text: str) -> str:
     return re.sub(r"[^a-z0-9-]", "", text.lower().replace(" ", "-"))
 
 
+def _one_liner(text: str, limit: int = 160) -> str:
+    """Condense text into a single-sentence OKF `description`."""
+    flat = " ".join(text.strip().split())
+    sentence = re.split(r"(?<=[.!?])\s", flat, maxsplit=1)[0] if flat else ""
+    summary = sentence or flat
+    return summary[: limit - 1].rstrip() + "…" if len(summary) > limit else summary
+
+
 def _merge_body_via_llm(existing_body: str, new_info: str) -> str:
     """Ask the review LLM to merge new info into existing body, preserving all content."""
     client = get_review_client()
@@ -52,6 +60,7 @@ def create_or_update_concept_page(
             slug=slug,
             page_type="concept",
             title=existing.title or title,
+            description=existing.description or _one_liner(definition),
             tags=list(set(existing.tags + tags)),
             confidence=existing.confidence or "medium",
             sources=existing.sources,
@@ -72,6 +81,7 @@ def create_or_update_concept_page(
             slug=slug,
             page_type="concept",
             title=title,
+            description=_one_liner(definition),
             tags=tags,
             confidence="medium",
             sources=[],
@@ -104,6 +114,7 @@ def create_or_update_entity_page(
             slug=slug,
             page_type="entity",
             title=existing.title or title,
+            description=existing.description or _one_liner(overview),
             tags=list(set(existing.tags + tags)),
             confidence=existing.confidence or "medium",
             sources=existing.sources,
@@ -124,6 +135,7 @@ def create_or_update_entity_page(
             slug=slug,
             page_type="entity",
             title=title,
+            description=_one_liner(overview),
             tags=tags,
             confidence="medium",
             sources=[],
@@ -145,8 +157,8 @@ def create_summary_page(
     entity_slugs: list[str],
 ) -> WikiPage:
     today = _TODAY()
-    concept_links = "\n".join(f"- [[concepts/{s}|{s}]]" for s in concept_slugs)
-    entity_links = "\n".join(f"- [[entities/{s}|{s}]]" for s in entity_slugs)
+    concept_links = "\n".join(f"- [{s}](/concepts/{s}.md)" for s in concept_slugs)
+    entity_links = "\n".join(f"- [{s}](/entities/{s}.md)" for s in entity_slugs)
 
     body_parts = [f"## Summary\n\n{summary_text}"]
     if concept_links:
@@ -159,6 +171,7 @@ def create_summary_page(
         slug=source_id,
         page_type="summary",
         title=title,
+        description=_one_liner(summary_text),
         tags=[],
         confidence="high",
         sources=[source_id],

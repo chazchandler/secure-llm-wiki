@@ -7,6 +7,7 @@ def test_wiki_page_roundtrip(tmp_path):
         slug="elt-orchestration",
         page_type="concept",
         title="ELT Orchestration",
+        description="How ELT jobs are orchestrated.",
         tags=["elt", "data"],
         confidence="high",
         sources=["rfc-v2"],
@@ -24,6 +25,7 @@ def test_wiki_page_roundtrip(tmp_path):
     assert loaded.tags == page.tags
     assert loaded.confidence == page.confidence
     assert loaded.sources == page.sources
+    assert loaded.description == page.description
 
 
 def test_lint_report_defaults():
@@ -51,5 +53,6 @@ def test_wiki_page_to_markdown_has_frontmatter():
     md = page.to_markdown()
     assert md.startswith("---\n")
     assert "title: Temporal" in md
-    assert "type: entity" in md
+    assert "type: entity" in md          # OKF required field
+    assert "timestamp: '2026-06-18'" in md  # OKF last-modified field
     assert "## Overview" in md

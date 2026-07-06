@@ -54,4 +54,4 @@ def test_create_summary_page_links_concepts(tmp_path):
         concept_slugs=["elt"], entity_slugs=["temporal"],
     )
     text = (store.wiki / "summaries" / "rfc.md").read_text()
-    assert "[[concepts/elt" in text or "[[entities/temporal" in text
+    assert "(/concepts/elt.md)" in text or "(/entities/temporal.md)" in text

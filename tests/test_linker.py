@@ -15,7 +15,7 @@ def test_adds_wikilink_for_unlinked_mention(tmp_path):
     page.write_text("# ELT\nWe use Temporal to orchestrate tasks.")
     modified = add_cross_links(store, new_slugs=["temporal"])
     assert page in modified
-    assert "[[entities/temporal" in page.read_text()
+    assert "[Temporal](/entities/temporal.md)" in page.read_text()
 
 
 def test_does_not_double_link(tmp_path):
@@ -26,9 +26,9 @@ def test_does_not_double_link(tmp_path):
         "tags: []\nsources: []\ncreated: '2026-06-18'\nupdated: '2026-06-18'\n---\n\n# Temporal"
     )
     page = store.wiki / "concepts" / "elt.md"
-    page.write_text("# ELT\nWe use [[entities/temporal|Temporal]] already.")
+    page.write_text("# ELT\nWe use [Temporal](/entities/temporal.md) already.")
     add_cross_links(store, new_slugs=["temporal"])
-    assert page.read_text().count("[[entities/temporal") == 1
+    assert page.read_text().count("](/entities/temporal.md)") == 1
 
 
 def test_skips_frontmatter_and_code_blocks(tmp_path):
