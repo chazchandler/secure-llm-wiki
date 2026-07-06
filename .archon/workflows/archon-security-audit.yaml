@@ -1,0 +1,621 @@
+name: archon-security-audit
+description: |
+  Use when: You want an in-depth, multi-model security audit of a repository that
+  produces a ranked, evidence-backed, false-positive-filtered vulnerability report.
+  Triggers: "security audit", "audit this repo for vulnerabilities", "find security
+            bugs", "pen-test the codebase", "MDASH audit", "vulnerability scan".
+  Does: Builds a code knowledge base (file inventory, symbol index, attack surface,
+        commit digest, AI threat model) staged with OWASP Top 10:2025 + CWE Top 25:2025
+        references; fans out a DIVERSE panel of parallel cross-vendor auditor agents
+        (Claude Sonnet + Claude Opus via live Serena LSP semantics, plus Codex) each
+        emitting structured CWE/OWASP findings; runs an adversarial proponent/opponent
+        debate with a judge to filter false positives; deterministically de-duplicates;
+        best-effort statically proves each cited location; and synthesizes a ranked
+        markdown report behind a human approval gate. Modeled on Microsoft's Codename
+        MDASH pipeline (Prepare → Scan → Validate → Dedupe → Prove).
+  NOT for: Dependency/license scanning (use a SCA tool), infrastructure scanning,
+           full dynamic fuzzing/ASan harnessing (the Prove stage is best-effort STATIC
+           only in v1), or single-file quick reviews (a plain chat turn is faster).
+
+provider: claude
+model: sonnet
+
+# Read-only audit over the live checkout. All writes are per-run under $ARTIFACTS_DIR
+# (outside the repo), so concurrent audits never race → mutates_checkout: false.
+worktree:
+  enabled: false
+mutates_checkout: false
+interactive: true   # REQUIRED: workflow contains an approval gate (review-report)
+
+tags: [security, audit]
+
+nodes:
+  # ════════════════════════════════════════════════════════════════════════
+  # PREPARE — build the knowledge base (deterministic) + AI threat model
+  # KB is passed DOWNSTREAM BY PATH ($ARTIFACTS_DIR/kb/*), never via $nodeId.output
+  # (inlining a multi-MB index into every prompt + DB row would bloat both).
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Stage an optional prior-run catalog into this run (env-gated, always runs).
+  - id: load-prior-catalog
+    timeout: 10000
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR"
+      OUT="$ARTIFACTS_DIR/prior-findings.json"
+      LOADED=false
+      if [ -n "${ARCHON_AUDIT_PRIOR_CATALOG:-}" ] && [ -f "${ARCHON_AUDIT_PRIOR_CATALOG}" ]; then
+        cp "${ARCHON_AUDIT_PRIOR_CATALOG}" "$OUT.tmp"
+        LOADED=true
+      else
+        printf '[]' > "$OUT.tmp"
+      fi
+      mv "$OUT.tmp" "$OUT"
+      printf '{"prior_catalog_loaded":%s}\n' "$LOADED"
+
+  # Stage the OWASP Top 10:2025 + CWE Top 25:2025 vocabulary into the KB.
+  - id: kb-vuln-catalog
+    timeout: 10000
+    bash: |
+      set -uo pipefail
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      mkdir -p "$ARTIFACTS_DIR/kb"
+      cp "$ROOT/.archon/security-audit-vocab/owasp-top-10-2025.md" "$ARTIFACTS_DIR/kb/owasp-top-10.md"
+      cp "$ROOT/.archon/security-audit-vocab/cwe-top-25-2025.md"   "$ARTIFACTS_DIR/kb/cwe-top-25.md"
+      printf '{"vocab_staged":true,"files":["owasp-top-10.md","cwe-top-25.md"]}\n'
+
+  # Tracked-file inventory + per-language counts (portable: awk, no bash assoc arrays).
+  - id: kb-inventory
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/kb"
+      git ls-files > "$ARTIFACTS_DIR/kb/file-list.txt" 2>/dev/null || printf '' > "$ARTIFACTS_DIR/kb/file-list.txt"
+      TOTAL=$(wc -l < "$ARTIFACTS_DIR/kb/file-list.txt" | tr -d ' ')
+      LANGJSON=$(awk '
+        { f=$0
+          if      (f ~ /\.tsx?$/)                        ts++
+          else if (f ~ /\.(m|c)?js[x]?$/)                js++
+          else if (f ~ /\.py$/)                          py++
+          else if (f ~ /\.go$/)                          go++
+          else if (f ~ /\.rs$/)                          rs++
+          else if (f ~ /\.java$/)                        jv++
+          else if (f ~ /\.(c|h|cpp|cc|hpp|hxx|cxx)$/)    cpp++
+        }
+        END { s=""
+          if (ts)  { s=s"\"typescript\":"ts }
+          if (js)  { if(s)s=s","; s=s"\"javascript\":"js }
+          if (py)  { if(s)s=s","; s=s"\"python\":"py }
+          if (go)  { if(s)s=s","; s=s"\"go\":"go }
+          if (rs)  { if(s)s=s","; s=s"\"rust\":"rs }
+          if (jv)  { if(s)s=s","; s=s"\"java\":"jv }
+          if (cpp) { if(s)s=s","; s=s"\"c_cpp\":"cpp }
+          print s
+        }' "$ARTIFACTS_DIR/kb/file-list.txt")
+      printf '{"tracked_files":%s,"languages":{%s}}\n' "$TOTAL" "$LANGJSON" > "$ARTIFACTS_DIR/kb/inventory.json.tmp"
+      mv "$ARTIFACTS_DIR/kb/inventory.json.tmp" "$ARTIFACTS_DIR/kb/inventory.json"
+      cat "$ARTIFACTS_DIR/kb/inventory.json"
+
+  # Bounded static symbol INDEX (declarations only — no call-graph, no sinks).
+  # Serena owns call-graph/reachability depth; kb-attack-surface owns sinks.
+  - id: kb-symbols
+    script: security-audit-build-symbols
+    runtime: bun
+    timeout: 120000
+    depends_on: [kb-inventory]
+
+  # Entry points + dangerous sinks via ripgrep-style patterns (JSON via awk).
+  - id: kb-attack-surface
+    timeout: 60000
+    depends_on: [kb-inventory]
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/kb"
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      cd "$ROOT"
+      PATTERNS='(eval\(|new Function\(|child_process\.exec|execSync|spawn\(|system\(|popen|\.query\(|\.raw\(|\.exec\(|innerHTML|dangerouslySetInnerHTML|document\.write|outerHTML|fetch\(|axios\.|http\.(get|post|request)|unserialize|pickle\.load|readObject|XMLDecoder|yaml\.load|crypto\.createDecipher|\bmd5\b|\bsha1\b|jwt\.verify|JSON\.parse|redirect\(|res\.(render|send)|querySelector)'
+      grep -rnE "$PATTERNS" \
+        --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' --include='*.mjs' \
+        --include='*.py' --include='*.go' --include='*.rs' --include='*.java' \
+        --include='*.c' --include='*.cpp' --include='*.cc' --include='*.hpp' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=build \
+        --exclude-dir=.archon --exclude-dir=.next --exclude-dir=coverage --exclude-dir=target \
+        . 2>/dev/null | head -n 8000 \
+      | awk -F: '
+        function esc(s,  r){ r=s; gsub(/\\/,"\\\\",r); gsub(/"/,"\\\"",r); gsub(/[\t\r\n]/," ",r); return r }
+        BEGIN { printf "[" }
+        { if (NR>1) printf ","; m=$0; sub(/^([^:]*):([^:]*):/, "", m);
+          printf "{\"file\":\"%s\",\"line\":\"%s\",\"match\":\"%s\"}", esc($1), esc($2), esc(m) }
+        END { printf "]\n" }' > "$ARTIFACTS_DIR/kb/attack-surface.json.tmp"
+      mv "$ARTIFACTS_DIR/kb/attack-surface.json.tmp" "$ARTIFACTS_DIR/kb/attack-surface.json"
+      N=$(grep -o '"file"' "$ARTIFACTS_DIR/kb/attack-surface.json" | wc -l | tr -d ' ')
+      printf '{"attack_surface_entries":%s}\n' "$N"
+
+  # Security-relevant recent commits (markdown digest).
+  - id: kb-commit-digest
+    timeout: 30000
+    depends_on: [kb-inventory]
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/kb"
+      {
+        echo "# Recent security-relevant commits"
+        echo
+        echo "_Generated via 'git log -G' over the last 200 commits (security-keyword diffs)._"
+        echo
+        git log -G '(password|secret|token|api[_-]?key|auth|crypt|security|vuln|cve|inject|xss|sqli|csrf|ssrf|rce|escap|sanitiz|validat|permission|privileg|overflow|buffer|memory|unsafe|deserialize|exec|eval|random)' \
+          -n 200 --pretty=format:'- %h %ad %s' --date=short 2>/dev/null || echo '_(no git history or no matches)_'
+      } > "$ARTIFACTS_DIR/kb/commit-digest.md.tmp"
+      mv "$ARTIFACTS_DIR/kb/commit-digest.md.tmp" "$ARTIFACTS_DIR/kb/commit-digest.md"
+      printf '{"commit_digest":true}\n'
+
+  # AI threat model reading the four deterministic KB artifacts above.
+  - id: threat-model
+    provider: claude
+    model: sonnet
+    context: fresh
+    output_type: threat_model
+    depends_on: [kb-symbols, kb-attack-surface, kb-commit-digest]
+    allowed_tools: [Read, Glob, Grep, Bash, Write]
+    prompt: |
+      You are a security architect building a threat model for this repository.
+
+      Read the knowledge base at `$ARTIFACTS_DIR/kb/`:
+      - `inventory.json` (tracked files + language mix), `file-list.txt` (full file list)
+      - `symbols.json` (symbol declarations), `attack-surface.json` (entry points + sinks)
+      - `commit-digest.md` (recent security-relevant changes)
+
+      Produce a concise threat model and WRITE it to `$ARTIFACTS_DIR/kb/threat-model.md` using the Write tool:
+      1. **Architecture & trust boundaries** — what the system is, where untrusted input enters, where it's processed.
+      2. **High-value targets** — ranked list of the most security-critical files/modules (auth, crypto, parsing, command exec, data access) and WHY each is high-value. Cite specific files from `symbols.json`/`attack-surface.json`.
+      3. **Top threat hypotheses** — concrete CWE-tagged hypotheses the auditor panel should prioritize (e.g. "CWE-89 in the query builder at src/db.ts", "CWE-79 in the comment renderer"). Each hypothesis: CWE id, suspected file:line, why it's plausible from the KB.
+
+      Keep it scannable (under ~300 lines). This orients the auditor agents — they do the deep per-finding work.
+
+  # Publish a typed manifest of the KB for downstream discovery (typed sidecar).
+  - id: kb-manifest
+    output_type: knowledge_base
+    depends_on: [threat-model, kb-vuln-catalog]
+    timeout: 10000
+    bash: |
+      set -uo pipefail
+      KB="$ARTIFACTS_DIR/kb"
+      mkdir -p "$KB"
+      printf '{"kb_dir":"%s","files":[' "$KB"
+      first=1
+      for f in "$KB"/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        size=$(wc -c < "$f" | tr -d ' ')
+        [ "$first" -eq 1 ] && first=0 || printf ','
+        printf '{"file":"%s","bytes":%s}' "$name" "$size"
+      done
+      printf ']}\n'
+
+  # ════════════════════════════════════════════════════════════════════════
+  # SCAN — diverse cross-vendor auditor panel (parallel layer, fresh context)
+  # ════════════════════════════════════════════════════════════════════════
+
+  - id: auditor-sonnet
+    provider: claude
+    model: sonnet
+    context: fresh
+    mcp: .archon/mcp/serena.json
+    output_type: findings
+    maxBudgetUsd: 10
+    depends_on: [kb-manifest]
+    allowed_tools: [Read, Glob, Grep, Bash]
+    # NOTE: root MUST be `type: object` — OpenAI's Structured Outputs API rejects a
+    # top-level `type: array` schema outright (400 invalid_json_schema: "schema must
+    # be a JSON Schema of 'type: object'"). The findings list is wrapped under a
+    # `findings` property. Downstream consumers (merge-candidates' readJsonArray,
+    # security-audit-dedupe.ts's readJudgeFindings) already tolerate this shape —
+    # they slice from the first `[` to the last `]` in the sidecar text, which lands
+    # on the array regardless of whether it's bare or wrapped in an object.
+    output_format:
+      type: object
+      properties:
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              cwe: { type: string }
+              title: { type: string }
+              severity: { type: string, enum: [critical, high, medium, low, info] }
+              confidence: { type: [string, "null"], enum: [high, medium, low, null] }
+              file: { type: string }
+              line: { type: [string, "null"] }
+              evidence: { type: string }
+              reachability: { type: [string, "null"] }
+              recommendation: { type: string }
+            required: [id, cwe, title, severity, confidence, file, line, evidence, reachability, recommendation]
+      required: [findings]
+    prompt: |
+      You are a senior vulnerability auditor. Audit this repository for real, exploitable
+      security weaknesses. Do NOT speculate without evidence — every finding must cite a
+      concrete `file:line` and quote the offending code.
+
+      First read the knowledge base at `$ARTIFACTS_DIR/kb/` — especially `threat-model.md`
+      (prioritized targets), `attack-surface.json` (sinks), `owasp-top-10.md` and
+      `cwe-top-25.md` (canonical CWE/OWASP categories — cite these ids, not memory).
+
+      Serena MCP semantic tools are available (LSP-grade). USE THEM to verify
+      reachability: `find_symbol`, `find_referencing_symbols`, `get_symbols_overview`,
+      `search_for_pattern`, `find_implementations`. Trace untrusted input from source to
+      sink to decide whether a weakness is actually reachable. Do NOT call Serena's
+      edit/shell tools (read-only audit). If Serena is unavailable, fall back to
+      Read/Grep/Bash over the static KB — still produce your best findings.
+
+      Hunt for: CWE Top 25 (XSS, SQLi, CSRF, missing/incorrect authz, OOB write/read, path
+      traversal, command/code injection, deserialization, SSRF, resource limits) and OWASP
+      Top 10:2025, plus memory-safety issues where applicable.
+
+      Emit ONE entry per real issue in the `findings` array, following the output schema.
+      Set `severity` and `confidence` honestly. `reachability` = your traced source→sink
+      path (or `null`). `recommendation` = the concrete fix. If you find nothing
+      exploitable, return `{"findings": []}`.
+
+  - id: auditor-fable
+    provider: claude
+    model: fable
+    context: fresh
+    mcp: .archon/mcp/serena.json
+    output_type: findings
+    maxBudgetUsd: 10
+    depends_on: [kb-manifest]
+    allowed_tools: [Read, Glob, Grep, Bash]
+    # NOTE: root MUST be `type: object` — OpenAI's Structured Outputs API rejects a
+    # top-level `type: array` schema outright (400 invalid_json_schema: "schema must
+    # be a JSON Schema of 'type: object'"). The findings list is wrapped under a
+    # `findings` property. Downstream consumers (merge-candidates' readJsonArray,
+    # security-audit-dedupe.ts's readJudgeFindings) already tolerate this shape —
+    # they slice from the first `[` to the last `]` in the sidecar text, which lands
+    # on the array regardless of whether it's bare or wrapped in an object.
+    output_format:
+      type: object
+      properties:
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              cwe: { type: string }
+              title: { type: string }
+              severity: { type: string, enum: [critical, high, medium, low, info] }
+              confidence: { type: [string, "null"], enum: [high, medium, low, null] }
+              file: { type: string }
+              line: { type: [string, "null"] }
+              evidence: { type: string }
+              reachability: { type: [string, "null"] }
+              recommendation: { type: string }
+            required: [id, cwe, title, severity, confidence, file, line, evidence, reachability, recommendation]
+      required: [findings]
+    prompt: |
+      You are a principal security researcher doing a DEEP second pass with a different
+      model than the Sonnet auditor — your job is to find what it missed and to
+      independently corroborate or surface harder-to-reach bugs.
+
+      Read the knowledge base at `$ARTIFACTS_DIR/kb/` (`threat-model.md`, `symbols.json`,
+      `attack-surface.json`, `owasp-top-10.md`, `cwe-top-25.md`). Use Serena MCP tools
+      (`find_symbol`, `find_referencing_symbols`, `get_symbols_overview`,
+      `search_for_pattern`) to perform multi-step taint analysis — trace data from
+      untrusted sources through to dangerous sinks and confirm reachability before
+      reporting. Read-only: do not use Serena's edit/shell tools. If Serena is absent,
+      use Read/Grep/Bash.
+
+      Favor depth over breadth: prioritize logic bugs, broken authz, race conditions,
+      deserialization, injection, and memory-safety issues with a real exploit path.
+      Cite `file:line` + code for every finding. Emit each in the `findings` array per the
+      schema with honest severity/confidence and a traced `reachability`. Return
+      `{"findings": []}` if nothing is real.
+
+  - id: auditor-codex
+    provider: codex
+    model: gpt-5.4
+    context: fresh
+    output_type: findings
+    maxBudgetUsd: 10
+    depends_on: [kb-manifest]
+    # NOTE: no `allowed_tools` here — Codex does not support per-node tool restrictions
+    # (the validator warns it would be ignored). Read-only posture is enforced by the
+    # prompt + `mutates_checkout: false`, same as the Bash-capable Claude auditors.
+    # NOTE: root MUST be `type: object` — OpenAI's Structured Outputs API rejects a
+    # top-level `type: array` schema outright (400 invalid_json_schema: "schema must
+    # be a JSON Schema of 'type: object'"). The findings list is wrapped under a
+    # `findings` property. Downstream consumers (merge-candidates' readJsonArray,
+    # security-audit-dedupe.ts's readJudgeFindings) already tolerate this shape —
+    # they slice from the first `[` to the last `]` in the sidecar text, which lands
+    # on the array regardless of whether it's bare or wrapped in an object.
+    output_format:
+      type: object
+      properties:
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              cwe: { type: string }
+              title: { type: string }
+              severity: { type: string, enum: [critical, high, medium, low, info] }
+              confidence: { type: [string, "null"], enum: [high, medium, low, null] }
+              file: { type: string }
+              line: { type: [string, "null"] }
+              evidence: { type: string }
+              reachability: { type: [string, "null"] }
+              recommendation: { type: string }
+            required: [id, cwe, title, severity, confidence, file, line, evidence, reachability, recommendation]
+      required: [findings]
+    prompt: |
+      You are a vulnerability auditor running on a different vendor (Codex) for
+      cross-model diversity — Serena MCP is NOT available to you; use Read/Grep/Bash plus
+      the static knowledge base at `$ARTIFACTS_DIR/kb/` (`threat-model.md`,
+      `attack-surface.json`, `symbols.json`, `owasp-top-10.md`, `cwe-top-25.md`).
+
+      Audit for CWE Top 25 + OWASP Top 10:2025 + memory safety. Confirm each candidate by
+      reading the actual code (cite `file:line` + quote). Emit each in the `findings`
+      array per the schema with honest severity/confidence, a `reachability` assessment,
+      and a concrete fix. Return `{"findings": []}` if nothing is exploitable.
+
+  # ════════════════════════════════════════════════════════════════════════
+  # VALIDATE — merge candidates, then adversarial debate + judge
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Union prior catalog + the three auditor typed sidecars, tagging each by source.
+  # NOTE: trigger_rule is `one_success`, NOT `none_failed_min_one_success` as the plan
+  # text suggested. The engine (dag-executor.ts:692-696) evaluates
+  # `none_failed_min_one_success` as "skip if ANY upstream failed" — which would abort
+  # the whole pipeline when a single auditor lacks a credential. `one_success`
+  # (dag-executor.ts:690-691) correctly proceeds when ≥1 upstream succeeded, delivering
+  # the plan's stated partial-coverage goal. Missing auditor sidecars read as [].
+  - id: merge-candidates
+    runtime: bun
+    timeout: 30000
+    trigger_rule: one_success
+    depends_on: [load-prior-catalog, auditor-sonnet, auditor-fable, auditor-codex]
+    script: |
+      import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+      import { resolve } from 'node:path';
+      const ad = process.env['ARTIFACTS_DIR'] ?? '';
+      if (!ad) { console.error('ARTIFACTS_DIR required'); process.exit(1); }
+      function readJsonArray(p) {
+        if (!existsSync(p)) return [];
+        let t = readFileSync(p, 'utf8').trim();
+        if (!t) return [];
+        const f = t.match(/```(?:json)?\s*([\s\S]*?)```/); if (f) t = f[1].trim();
+        const s = t.indexOf('['), e = t.lastIndexOf(']');
+        if (s === -1 || e === -1 || e < s) return [];
+        try { const v = JSON.parse(t.slice(s, e + 1)); return Array.isArray(v) ? v : []; } catch { return []; }
+      }
+      const tag = (arr, source) => arr
+        .map((f) => (f && typeof f === 'object' ? { ...f, source } : null))
+        .filter(Boolean);
+      const prior  = tag(readJsonArray(resolve(ad, 'prior-findings.json')),  'prior');
+      const sonnet = tag(readJsonArray(resolve(ad, 'nodes', 'auditor-sonnet.md')), 'sonnet');
+      const fable   = tag(readJsonArray(resolve(ad, 'nodes', 'auditor-fable.md')),   'fable');
+      const codex  = tag(readJsonArray(resolve(ad, 'nodes', 'auditor-codex.md')),  'codex');
+      const all = [...prior, ...sonnet, ...fable, ...codex];
+      const finalPath = resolve(ad, 'findings-candidates.json');
+      writeFileSync(finalPath + '.tmp', JSON.stringify(all, null, 2));
+      renameSync(finalPath + '.tmp', finalPath);
+      console.log(JSON.stringify({ count: all.length, prior: prior.length, sonnet: sonnet.length, fable: fable.length, codex: codex.length }));
+
+  - id: debater-proponent
+    provider: claude
+    model: sonnet
+    context: fresh
+    output_type: debate_proponent
+    depends_on: [merge-candidates]
+    allowed_tools: [Read, Glob, Grep, Bash]
+    prompt: |
+      You are the PROPONENT in a security-finding debate. Your job is to argue, for EACH
+      candidate finding, that it is REAL and EXPLOITABLE.
+
+      Read the candidate findings at `$ARTIFACTS_DIR/findings-candidates.json`. For each
+      finding, verify the cited code with Read/Grep and build the strongest case FOR it:
+      trace the reachability path, identify the preconditions, and explain how an attacker
+      would trigger it. Be rigorous — only argue forcefully where the evidence supports it.
+
+      Write your per-finding arguments as plain text (one section per finding id). Where a
+      finding is weak, say so honestly rather than overclaiming. Cite `file:line` evidence.
+
+  - id: debater-opponent
+    provider: claude
+    model: sonnet
+    context: fresh
+    output_type: debate_opponent
+    depends_on: [merge-candidates]
+    allowed_tools: [Read, Glob, Grep, Bash]
+    prompt: |
+      You are the OPPONENT in a security-finding debate — an adversarial false-positive
+      hunter. Your job is to refute EACH candidate finding.
+
+      Read the candidate findings at `$ARTIFACTS_DIR/findings-candidates.json`. For each,
+      verify the cited code with Read/Grep and argue the strongest case AGAINST it: is the
+      input actually untrusted? Is there upstream validation/sanitization/encoding that
+      neutralizes it? Is the sink unreachable? Is severity overstated? Does existing
+      framework protection mitigate it?
+
+      Write your per-finding rebuttals as plain text (one section per finding id). Be
+      skeptical and specific — cite `file:line` of any defensive code. Where a finding
+      genuinely holds up, concede it honestly rather than contriving a rebuttal.
+
+  - id: judge
+    provider: claude
+    model: fable
+    context: fresh
+    output_type: judge
+    depends_on: [debater-proponent, debater-opponent]
+    allowed_tools: [Read, Glob, Grep, Bash]
+    # NOTE: root MUST be `type: object` (see auditor nodes above for why) — the
+    # adjudicated findings list is wrapped under a `findings` property.
+    output_format:
+      type: object
+      properties:
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              cwe: { type: string }
+              title: { type: string }
+              severity: { type: string, enum: [critical, high, medium, low, info] }
+              confidence: { type: [string, "null"], enum: [high, medium, low, null] }
+              file: { type: string }
+              line: { type: [string, "null"] }
+              evidence: { type: string }
+              reachability: { type: [string, "null"] }
+              recommendation: { type: string }
+              verdict: { type: string, enum: [confirmed, refuted, uncertain] }
+              reachability_score: { type: [number, "null"] }
+              rationale: { type: string }
+            required: [id, cwe, title, severity, confidence, file, line, evidence, reachability, recommendation, verdict, reachability_score, rationale]
+      required: [findings]
+    prompt: |
+      You are the JUDGE. Weigh the proponent and opponent arguments and render a verdict
+      on every candidate finding.
+
+      Read:
+      - `$ARTIFACTS_DIR/findings-candidates.json` (the findings under adjudication)
+      - `$ARTIFACTS_DIR/nodes/debater-proponent.md` (arguments FOR)
+      - `$ARTIFACTS_DIR/nodes/debater-opponent.md` (arguments AGAINST)
+
+      You may use Read/Grep/Bash to independently re-check disputed code. For each finding
+      emit ONE adjudicated record in the `findings` array per the output schema, carrying
+      forward the finding's fields and adding:
+      - `verdict`: `confirmed` (real & exploitable), `refuted` (false positive), or
+        `uncertain` (needs more evidence).
+      - `reachability_score`: 0–10 (how reachable/exploitable the path is).
+      - `rationale`: 1–3 sentences citing which debate arguments and code evidence carried
+        the decision.
+
+      Adjust `severity`/`confidence` if the debate changed your view. Include ALL
+      candidates (confirmed, refuted, AND uncertain) so downstream dedupe/report can show
+      the full adjudicated picture.
+
+  # ════════════════════════════════════════════════════════════════════════
+  # DEDUPE — programmatic patch-based grouping of adjudicated findings
+  # ════════════════════════════════════════════════════════════════════════
+
+  - id: dedupe-findings
+    script: security-audit-dedupe
+    runtime: bun
+    output_type: deduped
+    timeout: 30000
+    depends_on: [judge]
+
+  # ════════════════════════════════════════════════════════════════════════
+  # PROVE — best-effort STATIC proof + pipeline-status manifest (no dynamic exec)
+  # ════════════════════════════════════════════════════════════════════════
+
+  - id: prove-findings
+    runtime: bun
+    output_type: proven
+    timeout: 30000
+    depends_on: [dedupe-findings]
+    script: |
+      import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+      import { resolve } from 'node:path';
+      const ad = process.env['ARTIFACTS_DIR'] ?? '';
+      if (!ad) { console.error('ARTIFACTS_DIR required'); process.exit(1); }
+      const runId = process.env['WORKFLOW_ID'] ?? '';
+      function readJsonArray(p) {
+        if (!existsSync(p)) return [];
+        let t = readFileSync(p, 'utf8').trim();
+        if (!t) return [];
+        const f = t.match(/```(?:json)?\s*([\s\S]*?)```/); if (f) t = f[1].trim();
+        const s = t.indexOf('['), e = t.lastIndexOf(']');
+        if (s === -1 || e === -1 || e < s) return [];
+        try { const v = JSON.parse(t.slice(s, e + 1)); return Array.isArray(v) ? v : []; } catch { return []; }
+      }
+      const deduped = readJsonArray(resolve(ad, 'findings-deduped.json'));
+      const cwd = process.cwd();
+      // Best-effort STATIC proof only: corroborate the cited file:line exists. v1 does
+      // NOT dynamically execute untrusted reproducers (full ASan/fuzz is future work).
+      let verified = 0;
+      const proven = deduped.map((f) => {
+        const verdict = String(f['verdict'] ?? '').toLowerCase();
+        if (verdict === 'refuted') {
+          return { ...f, proof_status: 'not-feasible', proof_note: 'adjudicated refuted' };
+        }
+        const file = f['file'] ? resolve(cwd, String(f['file'])) : '';
+        const lm = String(f['line'] ?? '').match(/\d+/);
+        const lineNum = lm ? parseInt(lm[0], 10) : null;
+        let status = 'unproven';
+        let note = 'static best-effort only (dynamic proof is future work)';
+        if (file && existsSync(file)) {
+          try {
+            const lines = readFileSync(file, 'utf8').split('\n').length;
+            if (lineNum !== null && lineNum >= 1 && lineNum <= lines) {
+              status = 'proven'; note = `cited location verified (${String(f['file'])}:${lineNum} of ${lines})`; verified++;
+            } else { note = `file exists but cited line ${lineNum} out of range (file has ${lines} lines)`; }
+          } catch { note = 'file exists but unreadable'; }
+        } else { note = `cited file not found: ${f['file']}`; }
+        return { ...f, proof_status: status, proof_note: note };
+      });
+      const provenPath = resolve(ad, 'findings-proven.json');
+      writeFileSync(provenPath + '.tmp', JSON.stringify(proven, null, 2));
+      renameSync(provenPath + '.tmp', provenPath);
+      // Pipeline-status manifest (single writer; rewritten on any resume re-run).
+      const priorCount = readJsonArray(resolve(ad, 'prior-findings.json')).length;
+      const catalog = {
+        run_id: runId,
+        prior_catalog_merged: priorCount > 0,
+        stages: {
+          candidates:  { path: 'findings-candidates.json', count: readJsonArray(resolve(ad, 'findings-candidates.json')).length },
+          adjudicated: { path: 'nodes/judge.md',            count: readJsonArray(resolve(ad, 'nodes', 'judge.md')).length },
+          deduped:     { path: 'findings-deduped.json',     count: deduped.length },
+          proven:      { path: 'findings-proven.json',      count: proven.length },
+        },
+        produced_at: new Date().toISOString(),
+      };
+      const catPath = resolve(ad, 'findings-catalog.json');
+      writeFileSync(catPath + '.tmp', JSON.stringify(catalog, null, 2));
+      renameSync(catPath + '.tmp', catPath);
+      const byStatus = proven.reduce((m, f) => { const k = f['proof_status']; m[k] = (m[k] ?? 0) + 1; return m; }, {});
+      console.log(JSON.stringify({ proven: proven.length, statically_verified: verified, by_status: byStatus }));
+
+  # ════════════════════════════════════════════════════════════════════════
+  # REPORT — synthesized ranked markdown report (typed sidecar) + approval gate
+  # ════════════════════════════════════════════════════════════════════════
+
+  - id: report
+    provider: claude
+    model: fable
+    context: fresh
+    output_type: security_report
+    depends_on: [prove-findings]
+    allowed_tools: [Read, Glob, Grep, Bash]
+    prompt: |
+      You are a security report author. Synthesize the final audit report from the proven,
+      de-duplicated findings.
+
+      Read `$ARTIFACTS_DIR/findings-proven.json` (adjudicated, deduped, best-effort-proven
+      findings — each has `verdict`, `reachability_score`, `proof_status`, `severity`).
+
+      Write the report as your response (it is persisted as the typed artifact
+      `$ARTIFACTS/nodes/report.md`). Structure:
+      1. **Executive summary** — total findings by severity, overall risk posture, the
+         single most important thing to fix.
+      2. **Findings** — ranked by severity (critical → info), each with: title, CWE,
+         `file:line`, the code evidence, the judge's `verdict` + `reachability_score`,
+         the proof status, and a concrete remediation. Group confirmed findings first;
+         list `uncertain` separately; omit or briefly enumerate `refuted` ones.
+      3. **Appendix** — methodology note (multi-model panel + adversarial debate + judge),
+         and a one-line pointer to `$ARTIFACTS_DIR/findings-catalog.json` for the full
+         stage breakdown.
+
+      If there are no confirmed findings, say so clearly and explain what was checked.
+
+  - id: review-report
+    approval:
+      message: |
+        Security audit report ready at $ARTIFACTS_DIR/nodes/report.md.
+        Full findings catalog: $ARTIFACTS_DIR/findings-catalog.json.
+        Approve to finalize; reject with feedback to re-scope.
+      capture_response: true
+    depends_on: [report]
