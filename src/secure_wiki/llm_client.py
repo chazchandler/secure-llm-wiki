@@ -221,6 +221,24 @@ def get_review_client() -> OllamaClient | AnthropicClient:
     return _build_client("review")
 
 
+def get_embed_model() -> str:
+    """Resolve the embedding model name from the environment WITHOUT building a
+    client (no network, no credentials).
+
+    Returns "" when the configured provider has no embedding model (e.g.
+    anthropic) — i.e. embeddings are effectively disabled. Mirrors the model
+    resolution in :func:`get_embed_client`, so it names the model that
+    :func:`get_embed_client().embed` would actually use.
+    """
+    llm_provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    embed_provider = os.environ.get("EMBED_PROVIDER", llm_provider).lower()
+    if embed_provider == "openai":
+        return os.environ.get("EMBED_MODEL", _EMBED_DEFAULTS["openai"])
+    if embed_provider == "anthropic":
+        return ""
+    return os.environ.get("EMBED_MODEL", _EMBED_DEFAULTS.get("ollama", "nomic-embed-text"))
+
+
 def get_embed_client() -> OllamaClient | OpenAIEmbedClient:
     llm_provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
     embed_provider = os.environ.get("EMBED_PROVIDER", llm_provider).lower()

@@ -319,11 +319,21 @@ class WikiStore:
         path.write_text(page.to_markdown(), encoding="utf-8")
         return path
 
-    def _commit_many(self, paths: list[Path], message: str) -> None:
-        """Stage the given paths and make a single commit. Skips if nothing staged."""
+    def commit_paths(self, paths: list[Path], message: str) -> None:
+        """Stage the given paths (additions or deletions) and make one commit.
+
+        Uses ``git add -A`` per path so deletions are staged as well as
+        additions, and tolerates a pathspec that matches nothing (e.g. removing
+        a file left untracked by an older version of the store). No commit is
+        made if nothing ends up staged.
+
+        Public because non-claim artifacts (e.g. embeddings, see
+        ``EmbeddingStore``) commit themselves into the same wiki repo.
+        """
+        self._ensure_init()
         for path in paths:
             rel = str(path.relative_to(self.root))
-            _git(["add", rel], self.root)
+            subprocess.run(["git", "add", "-A", "--", rel], cwd=self.root, env=_GIT_ENV)
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=self.root,
@@ -332,6 +342,10 @@ class WikiStore:
         if result.returncode == 0:
             return  # nothing staged
         _git(["commit", "-m", message], self.root)
+
+    def _commit_many(self, paths: list[Path], message: str) -> None:
+        """Stage the given paths and make a single commit. Skips if nothing staged."""
+        self.commit_paths(paths, message)
 
     def update_index(self) -> Path:
         """Regenerate wiki/index.md as an OKF index file (see docs/okf-spec.md §6).

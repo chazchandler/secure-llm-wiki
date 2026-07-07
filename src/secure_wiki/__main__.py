@@ -58,7 +58,7 @@ from .review.interactive import (
 )
 from .gate.write_gate import GateDecision, run_write_gate
 from .ingestion.sanitizer import SanitizeReport, sanitize
-from .llm_client import get_embed_client, get_review_client
+from .llm_client import get_embed_client, get_embed_model, get_review_client
 from .models import ClaimStatus, SourceRef, TrustLevel
 from .prompts import QUERY_TASK_PROMPT
 from .read.hygiene import load_for_context
@@ -649,7 +649,10 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     store = WikiStore()
     emb_store = EmbeddingStore(store)
     existing = store.load_claims()
-    existing_embeddings = emb_store.load_all()
+    # Gate 5 only compares model-compatible vectors: a stale-model embedding
+    # yields a meaningless cosine score, so it is excluded here (not just warned).
+    existing_embeddings = emb_store.load_comparable(get_embed_model())
+    _warn_embed_model_drift(emb_store)
     sim_cfg = load_similarity_config()
 
     is_folder = len(sources) > 1
@@ -721,6 +724,23 @@ def _related_from_detail(detail: str, by_prefix: dict) -> object:
     return by_prefix.get(m.group(1)) if m else None
 
 
+def _warn_embed_model_drift(emb_store: EmbeddingStore) -> None:
+    """Warn if stored embeddings were produced by a different EMBED_MODEL.
+
+    Cosine similarity (Gate 5) is only comparable within a single embedding
+    model, so a swap silently degrades dedup/conflict detection until the
+    stale vectors are rebuilt with `reembed`.
+    """
+    current = get_embed_model()
+    stale = emb_store.model_drift(current)
+    if stale:
+        print(
+            f"[embed]    WARNING: existing embeddings from model(s) {sorted(stale)} "
+            f"differ from current EMBED_MODEL '{current}'. Gate 5 similarity is "
+            f"unreliable across models — run `reembed` to rebuild stale vectors."
+        )
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     """Resolve outstanding QUARANTINE/ESCALATE findings from any prior run."""
     store = WikiStore()
@@ -749,7 +769,8 @@ def cmd_review(args: argparse.Namespace) -> None:
         print("[review] finished with unaddressed finding(s) — they remain quarantined")
 
     existing = active
-    existing_embeddings = emb_store.load_all()
+    existing_embeddings = emb_store.load_comparable(get_embed_model())
+    _warn_embed_model_drift(emb_store)
     committed = kept = dropped = 0
     for (claim, detail), dec in zip(outstanding, decisions):
         cat = _apply_finding(
@@ -791,21 +812,34 @@ def cmd_reembed(args: argparse.Namespace) -> None:
 
     active = store.load_claims()
     existing_embeddings = emb_store.load_all()
+    current_model = get_embed_model()
+    stale = {
+        cid for cid, m in emb_store.load_models().items()
+        if m and current_model and m != current_model
+    }
 
-    # 1. Backfill embeddings for active claims missing one (repairs future dedup).
-    missing = [c for c in active if c.claim_id not in existing_embeddings]
+    # 1. (Re)embed active claims that have no vector OR whose vector was produced
+    #    by a different model — a stale EMBED_MODEL makes Gate 5 similarity invalid.
+    missing = [c for c in active if c.claim_id not in existing_embeddings or c.claim_id in stale]
+    n_stale = sum(1 for c in active if c.claim_id in stale)
     backfilled = failed = 0
     if missing:
-        with _spinner(f"[reembed]  backfilling {len(missing)} active claim(s)…"):
+        backfilled_paths = []
+        spin = f"[reembed]  (re)embedding {len(missing)} active claim(s)"
+        if n_stale:
+            spin += f" ({n_stale} stale-model)"
+        with _spinner(spin + "…"):
             for claim in missing:
                 emb = _safe_embed(claim.text)
                 if emb is None:
                     failed += 1
                     continue
-                emb_store.save(claim.claim_id, emb)
+                backfilled_paths.append(emb_store.save(claim.claim_id, emb, commit=False))
                 existing_embeddings[claim.claim_id] = emb
                 backfilled += 1
-    print(f"[reembed]  backfilled {backfilled} active claim(s)"
+        if backfilled_paths:
+            store.commit_paths(backfilled_paths, f"reembed: (re)embed {backfilled} embedding(s)")
+    print(f"[reembed]  (re)embedded {backfilled} active claim(s)"
           + (f", {failed} still failing" if failed else ""))
 
     if failed and backfilled == 0 and not existing_embeddings:
@@ -813,6 +847,9 @@ def cmd_reembed(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # 2. Re-gate quarantined consistency findings now that vectors are available.
+    #    Reload the comparable set so re-gating only measures against current-model
+    #    vectors (drops any stale-model embedding that failed to rebuild above).
+    existing_embeddings = emb_store.load_comparable(current_model)
     targets = [
         (c, d) for c, d in store.load_quarantined_detailed()
         if c.resolution is None and d.startswith("consistency:")
@@ -948,8 +985,7 @@ def cmd_clear(args: argparse.Namespace) -> None:
             print("[clear] Aborted.")
             return
         deleted = store.delete_quarantine()
-        for cid in deleted:
-            emb_store.delete(cid)
+        emb_store.delete_many(deleted)
         print(f"[clear] Removed {len(deleted)} quarantined claim(s).")
 
     elif args.trust:
@@ -964,8 +1000,7 @@ def cmd_clear(args: argparse.Namespace) -> None:
             print("[clear] Aborted.")
             return
         deleted = store.delete_by_trust(args.trust)
-        for cid in deleted:
-            emb_store.delete(cid)
+        emb_store.delete_many(deleted)
         print(f"[clear] Removed {len(deleted)} claim(s).")
 
     elif args.reset:
