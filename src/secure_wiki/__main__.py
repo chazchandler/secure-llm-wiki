@@ -462,6 +462,12 @@ def _run_pipeline(
         print(f"[sanitize] SUSPICIOUS — {', '.join(report.flags)}")
     else:
         print("[sanitize] clean")
+    # Extraction (the LLM-facing surface) gets the normalized/cleaned text.
+    # Hash and stored source stay on the RAW text below — that's the forensic
+    # record of what was received, and save_source's dedup substring-matches
+    # the stored content_hash, so rehashing cleaned_text would break re-ingest
+    # idempotency for every already-stored source (SEC-03).
+    clean_text = report.cleaned_text or source_text
 
     # 3. Build source ref
     source_ref = SourceRef(
@@ -471,7 +477,7 @@ def _run_pipeline(
         content_hash=SourceRef.compute_hash(source_text),
     )
 
-    # 4. Save source document (sanitized text; idempotent on re-ingest)
+    # 4. Save source document (raw text — the forensic record; idempotent on re-ingest)
     store.save_source(
         source_id=source_ref.id,
         uri=uri,
@@ -480,15 +486,20 @@ def _run_pipeline(
         text=source_text,
     )
 
-    # 5. Extract claims
+    # 5. Extract claims — the LLM-facing surface gets the cleaned text (SEC-03)
     with _spinner("[extract]  calling extraction model…"):
-        claims, extract_usage, parse_error = extract_claims(source_text, source_ref, trust)
+        claims, extract_usage, parse_error = extract_claims(clean_text, source_ref, trust)
     if not claims:
         if parse_error:
             print(f"[extract]  no claims extracted — {parse_error}")
         else:
             print("[extract]  no claims extracted — model returned an empty list")
         return 0, 0, 0, extract_usage
+    if parse_error:
+        print(f"[extract]  nonce/parse warning — quarantining {len(claims)} claim(s): {parse_error}")
+        for c in claims:
+            store.save_quarantined(c, gate_detail=f"extraction: {parse_error}")
+        return 0, len(claims), 0, extract_usage
     print(f"[extract]  {len(claims)} claim(s) extracted")
     print()
 
@@ -860,6 +871,10 @@ def cmd_reembed(args: argparse.Namespace) -> None:
 
     existing = active
     clean_report = SanitizeReport(cleaned_text="")
+    # review_result=passed intentionally skips Gate 4's adversarial review here:
+    # these claims already passed adversarial review at first ingest, and
+    # reembed only recomputes Gate 5 (consistency) after an embedding-service
+    # outage — it does not re-run LLM manipulation checks.
     passed = ReviewResult(passed=True, reasons=[])
     cleared = dropped = requar = escalated = deferred = 0
 

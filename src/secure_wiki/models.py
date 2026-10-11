@@ -9,6 +9,7 @@ helpers live in store/wiki_store.py.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -17,6 +18,20 @@ from typing import Optional
 import uuid
 
 import yaml
+
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _validate_claim_id(claim_id: str) -> str:
+    """Reject anything that isn't a canonical UUID (path-traversal defense, F-06).
+
+    `claim_id` is interpolated into filesystem paths (wiki_store.py) as
+    `f"{claim_id}.md"` with no other sanitization, so a value like
+    "../../etc/passwd" must never survive `from_dict`.
+    """
+    if not _UUID_RE.fullmatch(claim_id):
+        raise ValueError(f"invalid claim_id (must be a UUID): {claim_id!r}")
+    return claim_id
 
 
 class TrustLevel(str, Enum):
@@ -96,7 +111,7 @@ class Claim:
             text=d["text"],
             source=source,
             trust_level=TrustLevel(d["trust_level"]),
-            claim_id=d["claim_id"],
+            claim_id=_validate_claim_id(d["claim_id"]),
             ingested_at=d["ingested_at"],
             status=ClaimStatus(d["status"]),
             gates_passed=d.get("gates_passed", []),
@@ -142,7 +157,7 @@ class Correction:
             source_uri=d["source_uri"],
             section=d["section"],
             content_hash=d["content_hash"],
-            claim_id=d["claim_id"],
+            claim_id=_validate_claim_id(d["claim_id"]),
             action=d["action"],
             original_text=d["original_text"],
             corrected_text=d.get("corrected_text"),

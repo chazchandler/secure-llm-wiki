@@ -45,6 +45,32 @@ def test_update_concept_page_preserves_existing_content(tmp_path, monkeypatch):
     assert "Original content." in text
 
 
+def test_merge_prompt_contains_nonce_delimiters(tmp_path, monkeypatch):
+    """F-03: existing_body/new_info must be wrapped in nonce-delimited tags,
+    never interpolated bare into the merge prompt."""
+    store = WikiStore(root=tmp_path)
+    store.init()
+    existing = store.wiki / "concepts" / "elt.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "---\ntitle: ELT\ntype: concept\nconfidence: high\ntags: []\nsources: []\n"
+        "slug: elt\ncreated: '2026-06-18'\nupdated: '2026-06-18'\n---\n\n"
+        "## Definition\nOriginal content.\n"
+    )
+    mock_complete = MagicMock(return_value=MagicMock(text="## Definition\nOriginal content."))
+    monkeypatch.setattr(
+        "secure_wiki.graph.page_writer.get_review_client",
+        lambda: MagicMock(complete=mock_complete),
+    )
+    create_or_update_concept_page(
+        store, slug="elt", title="ELT", definition="ELT", tags=[], relevant_claims=[],
+    )
+    _system, user = mock_complete.call_args[0]
+    assert "<existing-" in user
+    assert "<new-info-" in user
+    assert "Original content." in user
+
+
 def test_create_summary_page_links_concepts(tmp_path):
     store = WikiStore(root=tmp_path)
     store.init()

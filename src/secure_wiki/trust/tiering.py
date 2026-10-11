@@ -10,6 +10,7 @@ assign_trust() handles per-source assignment.
 """
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,14 +121,16 @@ class TrustRegistry:
         self._rules.insert(0, TrustRule(pattern=pattern, level=level, comment=comment))
 
 
-_registry: TrustRegistry | None = None
-
-
+@functools.lru_cache(maxsize=1)
 def _get_registry() -> TrustRegistry:
-    global _registry
-    if _registry is None:
-        _registry = TrustRegistry.from_yaml()
-    return _registry
+    """Return the process-wide TrustRegistry singleton.
+
+    lru_cache makes first-call initialization concurrency-safe (F-07) — the
+    prior unlocked `if _registry is None` lazy init was a data race under
+    concurrent access. Call `_get_registry.cache_clear()` to force a reload
+    (e.g. in tests that mutate trust_rules.yaml between assertions).
+    """
+    return TrustRegistry.from_yaml()
 
 
 def assign_trust(uri: str) -> TrustLevel:

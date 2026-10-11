@@ -3,6 +3,8 @@ embedding-unavailable fallback (regression for the bogus 'contradicts N in the
 same section' escalations)."""
 from __future__ import annotations
 
+import pytest
+
 from secure_wiki.gate.write_gate import GateDecision, run_write_gate
 from secure_wiki.ingestion.sanitizer import SanitizeReport
 from secure_wiki.models import Claim, ClaimStatus, SourceRef, TrustLevel
@@ -93,3 +95,26 @@ def test_claim_carrying_injection_vector_is_quarantined():
     )
     assert out.decision == GateDecision.QUARANTINE
     assert out.detail.startswith("sanitizing:")
+
+
+# ── SEC-04: untrusted claims can never auto-commit as ACTIVE ───────────────
+
+def test_missing_review_result_raises_fail_closed():
+    """F-05: no precomputed review_result must never fall back to a blind
+    (empty source_text) adversarial review — it must raise instead."""
+    with pytest.raises(ValueError):
+        run_write_gate(_claim(), _CLEAN, existing_claims=[])
+
+
+def test_untrusted_claim_quarantined_on_empty_wiki():
+    untrusted = Claim(
+        text="an untrusted assertion",
+        source=SourceRef(id="s", uri="file:///s.md", section="full",
+                         content_hash=SourceRef.compute_hash("an untrusted assertion")),
+        trust_level=TrustLevel.UNTRUSTED,
+    )
+    out = run_write_gate(
+        untrusted, _CLEAN, existing_claims=[], review_result=_PASS,
+    )
+    assert out.decision == GateDecision.QUARANTINE
+    assert "trust_tier" in out.detail

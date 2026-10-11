@@ -106,6 +106,28 @@ class TestSaveClaim:
         assert (tmp_path / "wiki" / ".git").exists()
 
 
+class TestPathSafety:
+    def test_safe_page_path_rejects_traversal(self, tmp_path):
+        store = WikiStore(root=tmp_path / "wiki")
+        store.init()
+        with pytest.raises(ValueError):
+            store._safe_page_path(store.pages, "../../etc/passwd")
+
+    def test_commit_message_strips_newline_from_uri(self, tmp_path):
+        store = WikiStore(root=tmp_path / "wiki")
+        claim = _make_claim()
+        claim.source.uri = "https://attack.mitre.org/T1059\nplanted-log-line: fake"
+        store.save_claim(claim)
+        result = subprocess.run(
+            ["git", "log", "--format=%B", "-1"],
+            cwd=tmp_path / "wiki",
+            capture_output=True, text=True,
+        )
+        message = result.stdout.strip()
+        assert "\n" not in message
+        assert "planted-log-line: fake" in message  # content kept, just de-lineated
+
+
 class TestSaveQuarantined:
     def test_writes_to_quarantine_dir(self, tmp_path):
         store = WikiStore(root=tmp_path / "wiki")

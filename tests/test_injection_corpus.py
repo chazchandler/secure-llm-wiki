@@ -4,15 +4,14 @@ Loads the manifest and verifies that every attack is stopped at the EXPECTED
 gate, and that the benign control case passes all the way through to COMMIT.
 
 TestSanitizerLayer  — gate 1 only (no LLM needed)
-TestFullPipeline    — all 5 gates; review_write is mocked so tests are
-                      deterministic and run without a live Ollama/Anthropic
-                      connection.
+TestFullPipeline    — all 5 gates; a precomputed ReviewResult is passed
+                      directly to run_write_gate so tests are deterministic
+                      and run without a live Ollama/Anthropic connection.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -54,9 +53,9 @@ class TestSanitizerLayer:
 class TestFullPipeline:
     """Full pipeline regression: every attack must be stopped at its declared gate.
 
-    review_write is mocked — the adversarial review LLM is not called, keeping
-    tests fast and deterministic. The mock blocks exactly the cases whose
-    expected_stop_gate is 'adversarial_review'.
+    A precomputed ReviewResult is passed to run_write_gate — the adversarial
+    review LLM is never called, keeping tests fast and deterministic. It fails
+    exactly the cases whose expected_stop_gate is 'adversarial_review'.
     """
 
     def test_pipeline_decision(self, case):
@@ -111,8 +110,9 @@ class TestFullPipeline:
             ),
         )
 
-        with patch("secure_wiki.gate.write_gate.review_write", return_value=review_verdict):
-            outcome = run_write_gate(claim, sanitize_report, existing_claims)
+        outcome = run_write_gate(
+            claim, sanitize_report, existing_claims, review_result=review_verdict,
+        )
 
         if case["expected_stop_gate"] is None:
             assert outcome.decision == GateDecision.COMMIT, (

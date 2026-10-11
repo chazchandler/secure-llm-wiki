@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..models import Claim, Correction
+from ..prompts import strip_trust_markers
 
 _LINE = "─" * 60
 
@@ -205,10 +206,12 @@ def review_claims_interactive(
             corrections.append(make_correction(claim, "drop", None, dec.note))
             continue
         if dec.action == "edit" and dec.new_text and dec.new_text != claim.text:
+            # The Correction record keeps the operator-entered text verbatim for
+            # reconciliation; only the committed claim.text is sanitized (F-04).
             corrections.append(make_correction(claim, "edit", dec.new_text, dec.note))
-            claim.text = dec.new_text
-            if dec.note:
-                claim.review_notes = dec.note
+            claim.text = strip_trust_markers(dec.new_text)
+            provenance = "human-edited"
+            claim.review_notes = f"{provenance}; {dec.note}" if dec.note else provenance
         kept.append(claim)
 
     out("")

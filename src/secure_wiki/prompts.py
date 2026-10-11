@@ -216,8 +216,16 @@ def _safe_claim_text(text: str) -> str:
 
 
 def strip_trust_markers(text: str) -> str:
-    """Public API: remove forged [T]/[S]/[U] tokens from source-derived text."""
-    return _TRUST_MARKER_RE.sub("", text).strip()
+    """Public API: remove forged [T]/[S]/[U] tokens from source-derived text.
+
+    Iterates to a fixpoint — a single .sub() pass lets a nested marker like
+    "[[T]T]" survive as "[T]" (the inner "[T]" is removed, exposing a new one).
+    """
+    while True:
+        new_text = _TRUST_MARKER_RE.sub("", text)
+        if new_text == text:
+            return new_text.strip()
+        text = new_text
 
 
 # ===========================================================================

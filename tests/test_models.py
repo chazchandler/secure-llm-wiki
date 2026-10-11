@@ -1,5 +1,7 @@
 """Tests for WikiPage and LintReport dataclasses."""
-from secure_wiki.models import WikiPage, LintReport
+import pytest
+
+from secure_wiki.models import Claim, Correction, LintReport, WikiPage
 
 
 def test_wiki_page_roundtrip(tmp_path):
@@ -36,6 +38,51 @@ def test_lint_report_defaults():
     assert r.incomplete_pages == []
     assert r.low_confidence_claims == []
     assert r.auto_fixed == []
+
+
+def _claim_dict(claim_id: str) -> dict:
+    return {
+        "text": "a claim",
+        "source": {
+            "id": "s", "uri": "file:///s.md", "section": "full",
+            "content_hash": "abc123",
+        },
+        "trust_level": "trusted",
+        "claim_id": claim_id,
+        "ingested_at": "2026-06-18T00:00:00+00:00",
+        "status": "active",
+        "gates_passed": [],
+    }
+
+
+def _correction_dict(claim_id: str) -> dict:
+    return {
+        "source_id": "s",
+        "source_uri": "file:///s.md",
+        "section": "full",
+        "content_hash": "abc123",
+        "claim_id": claim_id,
+        "action": "edit",
+        "original_text": "orig",
+        "corrected_text": "fixed",
+    }
+
+
+def test_claim_from_dict_rejects_traversal_claim_id():
+    with pytest.raises(ValueError):
+        Claim.from_dict(_claim_dict("../../etc/passwd"))
+
+
+def test_correction_from_dict_rejects_traversal_claim_id():
+    with pytest.raises(ValueError):
+        Correction.from_dict(_correction_dict("../../etc/passwd"))
+
+
+def test_claim_from_dict_accepts_canonical_uuid():
+    import uuid
+    valid_id = str(uuid.uuid4())
+    claim = Claim.from_dict(_claim_dict(valid_id))
+    assert claim.claim_id == valid_id
 
 
 def test_wiki_page_to_markdown_has_frontmatter():

@@ -94,7 +94,6 @@ class TestCmdIngest:
 
         with patch("secure_wiki.__main__.extract_claims", return_value=(extracted, UsageInfo(100, 20), None)), \
              patch("secure_wiki.__main__.review_write", return_value=_pass), \
-             patch("secure_wiki.gate.write_gate.review_write", return_value=_pass), \
              patch("secure_wiki.__main__.enrich_wiki", return_value=(0, 0)):
             cmd_ingest(_args(source=str(source_file)))
 
@@ -112,8 +111,7 @@ class TestCmdIngest:
         _pass = ReviewResult(passed=True, reasons=[])
 
         with patch("secure_wiki.__main__.extract_claims", return_value=(extracted, UsageInfo(), None)), \
-             patch("secure_wiki.__main__.review_write", return_value=_pass), \
-             patch("secure_wiki.gate.write_gate.review_write", return_value=_pass):
+             patch("secure_wiki.__main__.review_write", return_value=_pass):
             cmd_ingest(_args(source=str(source_file)))
 
         out = capsys.readouterr().out
@@ -140,7 +138,6 @@ class TestCmdIngest:
 
         with patch("secure_wiki.__main__.extract_claims", return_value=(extracted, UsageInfo(), None)), \
              patch("secure_wiki.__main__.review_write", return_value=_pass), \
-             patch("secure_wiki.gate.write_gate.review_write", return_value=_pass), \
              patch("secure_wiki.__main__.enrich_wiki", return_value=(0, 0)):
             cmd_ingest(_args(source=str(source_file), trust="trusted"))
 

@@ -21,7 +21,7 @@ from enum import Enum
 
 from ..ingestion.sanitizer import SanitizeReport, sanitize
 from ..models import Claim, ClaimStatus, TrustLevel
-from ..review.adversarial import ReviewResult, review_write
+from ..review.adversarial import ReviewResult
 from ..store.embedding_store import cosine_similarity
 
 # Thresholds — overridable via trust_rules.yaml (loaded by caller)
@@ -63,13 +63,11 @@ def run_write_gate(
     sanitize_report: document-level ingest scan, retained as forensic context.
         Gate 1 re-sanitizes the individual claim text rather than gating on this
         whole-document report (see Gate 1 below).
-    existing_claims: active wiki claims used for trust-tier and consistency checks.
+    existing_claims: accepted for API compatibility with existing callers. Gate 3
+        no longer consults established content (SEC-04 — every untrusted claim
+        quarantines unconditionally); Gate 5 consistency compares embeddings via
+        existing_embeddings instead.
     """
-    existing = existing_claims or []
-    existing_trusted = [
-        c for c in existing
-        if c.trust_level == TrustLevel.TRUSTED and c.status == ClaimStatus.ACTIVE
-    ]
 
     # Gate 1: sanitizing — evaluate the CLAIM's own text, not the whole source.
     #
@@ -107,30 +105,27 @@ def run_write_gate(
         )
     claim.gates_passed.append("provenance")
 
-    # Gate 3: trust-tier — untrusted source cannot overwrite established content
-    if claim.trust_level == TrustLevel.UNTRUSTED and existing_trusted:
+    # Gate 3: trust-tier — untrusted source can never commit as ACTIVE, even on
+    # a fresh wiki with no existing trusted content (SEC-04).
+    if claim.trust_level == TrustLevel.UNTRUSTED:
         return GateOutcome(
             decision=GateDecision.QUARANTINE,
             claim=claim,
-            detail=(
-                f"trust_tier: untrusted claim would overwrite "
-                f"{len(existing_trusted)} established high-trust claim(s)"
-            ),
+            detail="trust_tier: untrusted source cannot commit as ACTIVE",
         )
     claim.gates_passed.append("trust_tier")
 
-    # Gate 4: adversarial review (use pre-computed batch result if supplied).
-    # The normal path (_run_pipeline) pre-computes a batch review with full
-    # source_text before entering the gate loop. This fallback is only reached
-    # in tests or when the gate is called directly without a batch result; in
-    # that case source_text is unavailable so we pass an empty string.
-    review = review_result or review_write(
-        proposed=[claim],
-        source_text="",
-        existing_high_trust=existing_trusted or None,
-    )
-    if not review.passed:
-        claim.review_notes = "; ".join(review.reasons)
+    # Gate 4: adversarial review — requires a precomputed result (F-05).
+    # The normal path (_run_pipeline) pre-computes a batch review with the full
+    # source_text before entering the gate loop; both production callers
+    # (_run_pipeline's batch review, cmd_reembed's hardcoded pass) always pass
+    # one. A caller with no review_result has no source_text to review against
+    # either, so silently reviewing "" was a blind rubber-stamp; fail closed
+    # instead of running that blind review.
+    if review_result is None:
+        raise ValueError("run_write_gate requires a precomputed review_result")
+    if not review_result.passed:
+        claim.review_notes = "; ".join(review_result.reasons)
         return GateOutcome(
             decision=GateDecision.QUARANTINE,
             claim=claim,

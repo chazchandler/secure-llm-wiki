@@ -17,6 +17,7 @@ The root defaults to ./wiki_data/ or $WIKI_DATA_PATH if set.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,6 +25,14 @@ from pathlib import Path
 import yaml
 
 from ..models import Claim, ClaimStatus, Correction, WikiPage
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_uri(uri: str) -> str:
+    """Strip control characters (newlines/CR) from a URI before it is
+    interpolated into a git commit message (F-08)."""
+    return _CONTROL_CHARS_RE.sub("", uri)
 
 _TRUST_RULES_TEMPLATE = """\
 # Trust rules for this wiki instance.
@@ -101,6 +110,18 @@ class WikiStore:
         self.corrections = self.root / "corrections"
         self.wiki = self.root / "wiki"
 
+    def _safe_page_path(self, directory: Path, claim_id: str) -> Path:
+        """Build ``directory / f"{claim_id}.md"`` and bounds-check it (F-06).
+
+        `claim_id` is already UUID-validated at the model layer (`models.py`),
+        but this is the last line of defense at the actual filesystem write:
+        raises ValueError if the resolved path escapes `directory`.
+        """
+        path = directory / f"{claim_id}.md"
+        resolved = path.resolve()
+        resolved.relative_to(directory.resolve())
+        return path
+
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
@@ -149,9 +170,9 @@ class WikiStore:
     def save_claim(self, claim: Claim, gate_detail: str = "") -> Path:
         """Write an ACTIVE claim to pages/ and commit."""
         self._ensure_init()
-        path = self.pages / f"{claim.claim_id}.md"
+        path = self._safe_page_path(self.pages, claim.claim_id)
         path.write_text(_serialize(claim, gate_detail), encoding="utf-8")
-        msg = f"add {claim.claim_id[:8]} [{claim.trust_level.value}] from {claim.source.uri}"
+        msg = f"add {claim.claim_id[:8]} [{claim.trust_level.value}] from {_clean_uri(claim.source.uri)}"
         self._commit(path, msg)
         return path
 
@@ -159,10 +180,10 @@ class WikiStore:
         """Write a QUARANTINED claim to quarantine/ and commit."""
         self._ensure_init()
         claim.status = ClaimStatus.QUARANTINED
-        path = self.quarantine / f"{claim.claim_id}.md"
+        path = self._safe_page_path(self.quarantine, claim.claim_id)
         path.write_text(_serialize(claim, gate_detail), encoding="utf-8")
         reason = gate_detail[:72] if gate_detail else "gate failed"
-        msg = f"quarantine {claim.claim_id[:8]} from {claim.source.uri}: {reason}"
+        msg = f"quarantine {claim.claim_id[:8]} from {_clean_uri(claim.source.uri)}: {reason}"
         self._commit(path, msg)
         return path
 
@@ -174,9 +195,9 @@ class WikiStore:
         """
         self._ensure_init()
         claim.status = ClaimStatus.ACTIVE
-        dest = self.pages / f"{claim.claim_id}.md"
+        dest = self._safe_page_path(self.pages, claim.claim_id)
         dest.write_text(_serialize(claim, gate_detail), encoding="utf-8")
-        src = self.quarantine / f"{claim.claim_id}.md"
+        src = self._safe_page_path(self.quarantine, claim.claim_id)
         paths = [dest]
         if src.exists():
             src.unlink()
@@ -188,7 +209,7 @@ class WikiStore:
         """Rewrite a quarantined claim in place (e.g. to record its resolution)."""
         self._ensure_init()
         claim.status = ClaimStatus.QUARANTINED
-        path = self.quarantine / f"{claim.claim_id}.md"
+        path = self._safe_page_path(self.quarantine, claim.claim_id)
         path.write_text(_serialize(claim, gate_detail), encoding="utf-8")
         self._commit(path, f"review {claim.claim_id[:8]} — {claim.resolution or 'kept'}")
         return path

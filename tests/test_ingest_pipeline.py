@@ -53,7 +53,6 @@ def test_pipeline_calls_enrich_after_gate_loop(tmp_path, monkeypatch):
 
     with patch("secure_wiki.__main__.extract_claims", return_value=([claim], UsageInfo(), None)), \
          patch("secure_wiki.__main__.review_write", return_value=_pass), \
-         patch("secure_wiki.gate.write_gate.review_write", return_value=_pass), \
          patch("secure_wiki.__main__.get_embed_client", side_effect=Exception("no embed")):
         _run_pipeline(
             str(source_file),
@@ -69,6 +68,81 @@ def test_pipeline_calls_enrich_after_gate_loop(tmp_path, monkeypatch):
 
     assert len(enrich_calls) == 1
     assert enrich_calls[0][0].text == claim.text
+
+
+def test_pipeline_quarantines_all_claims_on_parse_error(tmp_path, monkeypatch):
+    """A non-None parse_error (e.g. nonce mismatch/legacy format) must quarantine
+    every extracted claim rather than silently letting them flow to the gate."""
+    claim = _make_claim("a claim extracted despite a parse warning")
+    _pass = ReviewResult(passed=True, reasons=[])
+
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("some source content", encoding="utf-8")
+
+    store = WikiStore(root=tmp_path / "wiki")
+    emb_store = EmbeddingStore(store)
+    existing = []
+    existing_embeddings = {}
+    sim_cfg = {"duplicate_threshold": 0.95, "conflict_threshold": 0.85,
+               "auto_duplicate_threshold": 0.97}
+
+    with patch(
+        "secure_wiki.__main__.extract_claims",
+        return_value=([claim], UsageInfo(), "legacy format, nonce unverified"),
+    ), patch("secure_wiki.__main__.review_write", return_value=_pass):
+        committed, quarantined, escalated, _usage = _run_pipeline(
+            str(source_file),
+            TrustLevel.TRUSTED,
+            None,
+            "full",
+            store,
+            emb_store,
+            existing,
+            existing_embeddings,
+            sim_cfg,
+        )
+
+    assert (committed, quarantined, escalated) == (0, 1, 0)
+    quarantined_claims = store.load_quarantined()
+    assert len(quarantined_claims) == 1
+    assert quarantined_claims[0].text == claim.text
+    assert store.load_claims() == []
+
+
+def test_pipeline_feeds_cleaned_text_to_extraction_only(tmp_path, monkeypatch):
+    """SEC-03: extraction receives the sanitizer's cleaned_text; the stored
+    source and content_hash remain on the RAW text (dedup + forensic record)."""
+    claim = _make_claim("a claim")
+    _pass = ReviewResult(passed=True, reasons=[])
+    raw_text = "hello ​world"  # contains a zero-width space the sanitizer strips
+
+    source_file = tmp_path / "source.txt"
+    source_file.write_text(raw_text, encoding="utf-8")
+
+    store = WikiStore(root=tmp_path / "wiki")
+    emb_store = EmbeddingStore(store)
+    sim_cfg = {"duplicate_threshold": 0.95, "conflict_threshold": 0.85,
+               "auto_duplicate_threshold": 0.97}
+
+    captured_extract_text = {}
+
+    def fake_extract_claims(text, source_ref, trust_level):
+        captured_extract_text["text"] = text
+        return [claim], UsageInfo(), None
+
+    with patch("secure_wiki.__main__.extract_claims", side_effect=fake_extract_claims), \
+         patch("secure_wiki.__main__.review_write", return_value=_pass), \
+         patch("secure_wiki.__main__.get_embed_client", side_effect=Exception("no embed")), \
+         patch("secure_wiki.__main__.enrich_wiki", return_value=(0, 0)):
+        _run_pipeline(
+            str(source_file), TrustLevel.TRUSTED, None, "full",
+            store, emb_store, [], {}, sim_cfg,
+        )
+
+    assert "​" not in captured_extract_text["text"]
+    stored_source = (store.sources / f"{source_file.stem}.md").read_text(encoding="utf-8")
+    assert "​" in stored_source  # raw text preserved in the forensic record
+    assert SourceRef.compute_hash(raw_text) in stored_source  # hash computed on raw text
 
 
 def _store(tmp_path):

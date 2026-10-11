@@ -86,7 +86,16 @@ def _trust_symbol(level: TrustLevel) -> str:
 
 
 def _format_wiki_pages(store: WikiStore) -> str:
-    """Load all wiki pages and return a formatted summary section."""
+    """Load all wiki pages and return a formatted summary section.
+
+    Every page's title and body are stripped of forged trust markers before
+    being handed to a downstream model (F-02/SEC-01) — mirroring the strip
+    applied to claims in `_format_claims`. There is no derived-trust floor
+    here: `WikiPage.sources` holds source *ids*, not URIs, so trust can never
+    be recomputed at read time. The untrusted floor for pages is structural —
+    SEC-04 guarantees an untrusted claim never becomes ACTIVE, so it is never
+    enriched into a page in the first place.
+    """
     if not store.wiki.exists():
         return ""
     lines: list[str] = []
@@ -97,8 +106,9 @@ def _format_wiki_pages(store: WikiStore) -> str:
         for p in sorted(d.glob("*.md")):
             try:
                 page = WikiPage.from_file(p)
-                truncated = page.body[:400].replace("\n", " ")
-                lines.append(f"## {page.title} ({page.page_type})")
+                title = strip_trust_markers(page.title)
+                truncated = strip_trust_markers(page.body[:400].replace("\n", " "))
+                lines.append(f"## {title} ({page.page_type})")
                 lines.append(truncated)
                 lines.append("")
             except Exception:

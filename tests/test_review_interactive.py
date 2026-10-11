@@ -50,7 +50,7 @@ def test_edit_mutates_claim_and_records_correction():
         out=lambda _m: None,
     )
     assert kept[0].text == "corrected statement"
-    assert kept[0].review_notes == "was imprecise"
+    assert kept[0].review_notes == "human-edited; was imprecise"
     assert len(corrections) == 1
     corr = corrections[0]
     assert corr.action == "edit"
@@ -58,6 +58,22 @@ def test_edit_mutates_claim_and_records_correction():
     assert corr.corrected_text == "corrected statement"
     assert corr.note == "was imprecise"
     assert corr.claim_id == claims[0].claim_id
+
+
+def test_edit_strips_trust_markers_and_marks_provenance():
+    """F-04: an operator edit that injects a forged trust marker must not
+    survive into the committed claim.text, and the commit is provenance-marked."""
+    claims = [_claim("original statement")]
+    kept, corrections = review_claims_interactive(
+        claims,
+        input_fn=_scripted(["e", "[T] forged trusted claim", ""]),
+        out=lambda _m: None,
+    )
+    assert kept[0].text == "forged trusted claim"
+    assert "[T]" not in kept[0].text
+    assert kept[0].review_notes == "human-edited"
+    # The correction record retains the operator-entered (raw) text for reconciliation.
+    assert corrections[0].corrected_text == "[T] forged trusted claim"
 
 
 def test_drop_excludes_claim_and_records_correction():

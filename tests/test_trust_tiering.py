@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from secure_wiki.models import TrustLevel
-from secure_wiki.trust.tiering import TrustRegistry, assign_trust
+from secure_wiki.trust.tiering import TrustRegistry, _get_registry, assign_trust
 
 
 class TestBuiltinRules:
@@ -112,3 +112,16 @@ class TestModuleLevelFunction:
 
     def test_assign_trust_unknown(self):
         assert assign_trust("https://unknown.example.net/article") == TrustLevel.UNTRUSTED
+
+
+class TestRegistrySingleton:
+    def test_get_registry_returns_cached_singleton(self):
+        """F-07: repeated calls return the SAME instance (lru_cache), not a
+        freshly-constructed one from an unlocked lazy-init race."""
+        _get_registry.cache_clear()
+        try:
+            first = _get_registry()
+            second = _get_registry()
+            assert first is second
+        finally:
+            _get_registry.cache_clear()
