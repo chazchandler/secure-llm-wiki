@@ -103,3 +103,34 @@ def test_wiki_page_to_markdown_has_frontmatter():
     assert "type: entity" in md          # OKF required field
     assert "timestamp: '2026-06-18'" in md  # OKF last-modified field
     assert "## Overview" in md
+
+
+def test_wiki_page_to_markdown_omits_bare_slug():
+    """Regression test: frontmatter must not carry a bare `slug:` field.
+
+    save_wiki_page() writes the page to wiki/<type>s/<slug>.md — the bare
+    slug is only the filename stem, not the full bundle-relative identifier
+    (OKF Concept ID, docs/okf-spec.md §2) that includes the type subdirectory
+    (e.g. "entities/google-workspace"). A consumer that derives a page's
+    canonical slug from the full path will see this bare value disagree with
+    its own derivation and reject/hold the file as a slug conflict. Since
+    nothing in this codebase reads `slug` back out of frontmatter for an
+    purpose other than cosmetic (from_file() already falls back to
+    path.stem when absent), the field is dropped entirely rather than
+    corrected to the qualified form.
+    """
+    page = WikiPage(
+        slug="google-workspace",
+        page_type="entity",
+        title="Google Workspace",
+        tags=["identity"],
+        confidence="medium",
+        sources=[],
+        body="## Overview\nGoogle Workspace is Google's identity platform.",
+        created="2026-07-07",
+        updated="2026-07-07",
+    )
+    md = page.to_markdown()
+    import yaml as _yaml
+    frontmatter = _yaml.safe_load(md.split("---\n", 2)[1])
+    assert "slug" not in frontmatter

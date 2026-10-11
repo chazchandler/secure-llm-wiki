@@ -189,6 +189,15 @@ class WikiPage:
     description: str = ""    # OKF one-line summary
 
     def to_markdown(self) -> str:
+        # `slug` is intentionally NOT written to frontmatter. OKF's Concept ID
+        # (docs/okf-spec.md §2) is the bundle-relative path minus `.md`, e.g.
+        # `entities/google-workspace` for wiki/entities/google-workspace.md.
+        # self.slug only ever holds the bare filename stem (`google-workspace`)
+        # — write/save_wiki_page() put it in a type-named subdirectory, so a
+        # bare `slug:` in frontmatter always disagrees with a consumer that
+        # derives slugs from the full path, and gets a page held/rejected as a
+        # frontmatter/slug conflict. See the OKF spec and the regression test
+        # below for the full identifier shape.
         fm = yaml.dump(
             {
                 # OKF-recommended fields (type is REQUIRED)
@@ -200,7 +209,6 @@ class WikiPage:
                 # producer extensions
                 "confidence": self.confidence,
                 "sources": self.sources,
-                "slug": self.slug,
                 "created": self.created,
                 "updated": self.updated,
             },
